@@ -1,10 +1,11 @@
 # NextBillion.ai — Visual API Tester (Streamlit)
 # pip install streamlit requests pandas folium streamlit-folium
 
-import os
 import math
 import random
 import time
+import json
+import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -19,7 +20,8 @@ from streamlit_folium import st_folium
 # =========================
 # CONFIG
 # =========================
-DEFAULT_API_KEY = st.secrets.get("NEXTBILLION_API_KEY", os.getenv("NEXTBILLION_API_KEY", ""))
+DEFAULT_API_KEY = ""  # Leave blank in code; set via Streamlit Secrets (NEXTBILLION_API_KEY) or env var.
+DEFAULT_API_KEY = st.secrets.get("NEXTBILLION_API_KEY", os.getenv("NEXTBILLION_API_KEY", DEFAULT_API_KEY))
 NB_BASE = "https://api.nextbillion.io"
 UA = {"User-Agent": "NextBillion-Visual-Tester/1.0"}
 
@@ -630,7 +632,7 @@ with tabs[0]:
 
         st.markdown("### Stops table (editable)")
         df = pd.DataFrame(st.session_state.stops)
-        edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, key="stops_editor")
+        edited = st.data_editor(df, num_rows="dynamic", width=\"stretch\", key="stops_editor")
         st.session_state.stops = edited.to_dict(orient="records")
 
         st.markdown("### Stops map (red numbered pins)")
@@ -676,7 +678,7 @@ with tabs[1]:
         if st.session_state.last_geocode_json:
             st.download_button(
                 "Download last Geocode JSON",
-                data=pd.io.json.dumps(st.session_state.last_geocode_json, indent=2),
+                data=json.dumps(st.session_state.last_geocode_json, indent=2, default=str),
                 file_name="geocode_last.json",
                 mime="application/json",
             )
@@ -747,7 +749,7 @@ with tabs[2]:
         if st.session_state.last_places_json:
             st.download_button(
                 "Download last Places JSON",
-                data=pd.io.json.dumps(st.session_state.last_places_json, indent=2),
+                data=json.dumps(st.session_state.last_places_json, indent=2, default=str),
                 file_name="places_last.json",
                 mime="application/json",
             )
@@ -776,7 +778,7 @@ with tabs[2]:
                 st.success(f"Added {len(add_idx)} stops. Total stops: {len(st.session_state.stops)}")
 
             dfp = pd.DataFrame([{"title": r["title"], "lat": r["lat"], "lng": r["lng"]} for r in results])
-            st.dataframe(dfp, use_container_width=True)
+            st.dataframe(dfp, width=\"stretch\")
         else:
             st.warning("No items found. If your raw JSON has items but UI shows none, it’s usually schema variance—download JSON and share a sample item.")
 
@@ -1039,7 +1041,7 @@ with tabs[3]:
             if st.session_state.last_directions_json_before:
                 st.download_button(
                     "Download Directions (Before)",
-                    data=pd.io.json.dumps(st.session_state.last_directions_json_before, indent=2),
+                    data=json.dumps(st.session_state.last_directions_json_before, indent=2, default=str),
                     file_name="directions_before.json",
                     mime="application/json",
                 )
@@ -1047,7 +1049,7 @@ with tabs[3]:
             if st.session_state.last_directions_json_after:
                 st.download_button(
                     "Download Directions (After)",
-                    data=pd.io.json.dumps(st.session_state.last_directions_json_after, indent=2),
+                    data=json.dumps(st.session_state.last_directions_json_after, indent=2, default=str),
                     file_name="directions_after.json",
                     mime="application/json",
                 )
@@ -1055,7 +1057,7 @@ with tabs[3]:
             if st.session_state.last_opt_create_json:
                 st.download_button(
                     "Download VRP Create JSON",
-                    data=pd.io.json.dumps(st.session_state.last_opt_create_json, indent=2),
+                    data=json.dumps(st.session_state.last_opt_create_json, indent=2, default=str),
                     file_name="opt_create_last.json",
                     mime="application/json",
                 )
@@ -1063,7 +1065,7 @@ with tabs[3]:
             if st.session_state.last_opt_result_json:
                 st.download_button(
                     "Download VRP Result JSON",
-                    data=pd.io.json.dumps(st.session_state.last_opt_result_json, indent=2),
+                    data=json.dumps(st.session_state.last_opt_result_json, indent=2, default=str),
                     file_name="opt_result_last.json",
                     mime="application/json",
                 )
@@ -1105,7 +1107,7 @@ with tabs[4]:
             dm = st.session_state.last_matrix_json
             st.download_button(
                 "Download Distance Matrix JSON",
-                data=pd.io.json.dumps(dm, indent=2),
+                data=json.dumps(dm, indent=2, default=str),
                 file_name="distance_matrix_last.json",
                 mime="application/json",
             )
@@ -1127,12 +1129,12 @@ with tabs[4]:
             if matrix_dist:
                 st.markdown("### Distance (km)")
                 df_dist = pd.DataFrame(matrix_dist) / 1000.0
-                st.dataframe(df_dist.style.format("{:.2f}"), use_container_width=True)
+                st.dataframe(df_dist.style.format("{:.2f}"), width="stretch")
 
             if matrix_dur:
                 st.markdown("### Duration (minutes)")
                 df_dur = pd.DataFrame(matrix_dur) / 60.0
-                st.dataframe(df_dur.style.format("{:.1f}"), use_container_width=True)
+                st.dataframe(df_dur.style.format("{:.1f}"), width="stretch")
 
 
 # =========================
@@ -1180,7 +1182,7 @@ with tabs[5]:
             data = st.session_state.last_snap_json
             st.download_button(
                 "Download SnapToRoads JSON",
-                data=pd.io.json.dumps(data, indent=2),
+                data=json.dumps(data, indent=2, default=str),
                 file_name="snap_to_roads_last.json",
                 mime="application/json",
             )
@@ -1226,7 +1228,7 @@ with tabs[5]:
         data = st.session_state.last_iso_json
         st.download_button(
             "Download Isochrone JSON",
-            data=pd.io.json.dumps(data, indent=2),
+            data=json.dumps(data, indent=2, default=str),
             file_name="isochrone_last.json",
             mime="application/json",
         )
@@ -1244,5 +1246,3 @@ with tabs[5]:
             pass
 
         st_folium(m, height=520, use_container_width=True, key=f"iso_map_v{st.session_state.map_version}")
-
-
