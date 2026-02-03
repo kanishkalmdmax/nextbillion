@@ -1,6 +1,7 @@
 # NextBillion.ai — Visual API Tester (Streamlit)
 # pip install streamlit requests pandas folium streamlit-folium
 
+import os
 import math
 import random
 import time
@@ -1243,4 +1244,5 @@ with tabs[5]:
             pass
 
         st_folium(m, height=520, use_container_width=True, key=f"iso_map_v{st.session_state.map_version}")
+
 
