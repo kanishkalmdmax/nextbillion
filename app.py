@@ -476,43 +476,63 @@ def build_baseline_routes(stops_df: pd.DataFrame, vehicle_starts: List[Optional[
 
 def build_opt_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, cfg: dict, objective: str, seed: int) -> dict:
     """
-    Build a minimal Route Optimization payload.
-    Docs confirm:
-    - POST https://api.nextbillion.io/optimization/v2?key=...
-    - GET  https://api.nextbillion.io/optimization/v2/result?id=...&key=...
-    - Round trip by setting start_index == end_index (same location index).
+    Build a Route Optimization payload for:
+      POST https://api.nextbillion.io/optimization/v2?key=...
+      GET  https://api.nextbillion.io/optimization/v2/result?id=...&key=...
+
+    Key rules from docs:
+      - `locations` is an array of "lat,lng" strings, and `start_index`/`end_index` refer to indices in that array.
+      - Every vehicle must have a start location configured (via `start_index` or a depot workflow).
+      - For round trip: set `start_index` == `end_index`.
     """
     driver_count = int(cfg["driver_count"])
     depot_mode = cfg["depot_mode"]
     route_type = cfg["route_type"]
 
-    # Locations array: all depots first, then stops
+    rnd = random.Random(int(seed))
+
+    # ---------- Locations array ----------
+    # Convention: depots first, then stops
     locations: List[str] = []
-    depot_coords = []
-    if depot_mode != "open_route" and not depots_df.empty:
-        for _, r in depots_df.iterrows():
-            depot_coords.append((float(r["lat"]), float(r["lng"])))
-            locations.append(f"{float(r['lat'])},{float(r['lng'])}")
+    depot_coords: List[Tuple[float, float]] = []
+
+    # If depot mode expects depots but none are provided, create a synthetic depot.
+    # This prevents 400 errors caused by missing vehicle start locations.
+    if depot_mode != "open_route" and depots_df.empty:
+        if not stops_df.empty:
+            lat0 = float(stops_df["lat"].astype(float).mean())
+            lng0 = float(stops_df["lng"].astype(float).mean())
+        else:
+            lat0 = float(cfg.get("default_depot_lat", 0.0) or 0.0)
+            lng0 = float(cfg.get("default_depot_lng", 0.0) or 0.0)
+        depot_coords.append((lat0, lng0))
+        locations.append(f"{lat0},{lng0}")
+    else:
+        if depot_mode != "open_route" and not depots_df.empty:
+            for _, r in depots_df.iterrows():
+                lat0, lng0 = float(r["lat"]), float(r["lng"])
+                depot_coords.append((lat0, lng0))
+                locations.append(f"{lat0},{lng0}")
 
     stop_index_offset = len(locations)
+
     for _, r in stops_df.iterrows():
         locations.append(f"{float(r['lat'])},{float(r['lng'])}")
 
-    # Build jobs
+    # ---------- Jobs ----------
     jobs = []
     for idx, r in stops_df.reset_index(drop=True).iterrows():
         job = {
-            "id": int(idx + 1),  # clustering/optimization docs prefer positive integers
+            "id": int(idx + 1),  # jobs ids should be unique positive integers in most examples
             "location_index": stop_index_offset + idx,
         }
         tws = hhmm_to_seconds(r.get("tw_start", ""))
         twe = hhmm_to_seconds(r.get("tw_end", ""))
-        if tws is not None and twe is not None:
+        if tws is not None and twe is not None and twe >= tws:
             job["time_windows"] = [{"start": tws, "end": twe}]
         jobs.append(job)
 
-    # Vehicle starts
-    vehicle_starts = assign_depots_to_vehicles(depots_df, driver_count, depot_mode, seed)
+    # ---------- Vehicles ----------
     shift_start = hhmm_to_seconds(cfg.get("shift_start", "09:00")) or 9 * 3600
     shift_end = hhmm_to_seconds(cfg.get("shift_end", "18:00")) or 18 * 3600
 
@@ -522,19 +542,30 @@ def build_opt_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, cfg: dict
             "id": int(i + 1),
             "time_window": {"start": shift_start, "end": shift_end},
         }
-        if depot_mode == "open_route" or not depot_coords:
-            # open routes: no explicit start/end indices
-            pass
-        else:
-            start_coord = vehicle_starts[i] or depot_coords[0]
-            # find index in depot_coords
-            try:
-                depot_idx = depot_coords.index(start_coord)
-            except ValueError:
-                depot_idx = 0
-            v["start_index"] = depot_idx
+
+        # Ensure every vehicle has a start_index.
+        if depot_mode == "open_route":
+            # Open route: choose a start among stops (or fall back to index 0 if no stops)
+            if len(stops_df) > 0:
+                start_idx = stop_index_offset + (i % len(stops_df))
+            else:
+                start_idx = 0
+            v["start_index"] = int(start_idx)
             if route_type == "round_trip":
-                v["end_index"] = depot_idx
+                v["end_index"] = int(start_idx)
+        else:
+            # Depot-based: assign a depot index
+            if depot_coords:
+                depot_idx = i % len(depot_coords)
+                v["start_index"] = int(depot_idx)
+                if route_type == "round_trip":
+                    v["end_index"] = int(depot_idx)
+            else:
+                # Extremely defensive fallback (should not happen due to synthetic depot creation)
+                v["start_index"] = 0
+                if route_type == "round_trip":
+                    v["end_index"] = 0
+
         vehicles.append(v)
 
     options: Dict[str, Any] = {"objective": {"travel_cost": objective}}
