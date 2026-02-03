@@ -1,18 +1,26 @@
-# NextBillion.ai — Visual API Tester (Streamlit)
-# pip install streamlit requests pandas folium streamlit-folium
+# NextBillion.ai — Multi-Driver Routing Testbench (Streamlit)
+# Deploy on Streamlit Community Cloud. Set secret NEXTBILLION_API_KEY in Streamlit Secrets.
+#
+# Key features:
+# - Stops editor with optional time windows
+# - Driver/vehicle generator (default 25 for testing)
+# - Direct multi-vehicle Route Optimization (VRP) with Open vs Round-trip toggle
+# - Fair before/after comparison (ensures same trip type)
+# - Optional: raw Clustering API runner (paste JSON body)
+# - Lightweight backend logging (Cloud logs + in-app session logs)
 
-import math
-import random
+import os
 import time
 import json
-import os
-import logging
 import uuid
+import random
+import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 import requests
+import pandas as pd
 import streamlit as st
 import folium
 from folium.plugins import PolyLineTextPath
@@ -22,21 +30,18 @@ from streamlit_folium import st_folium
 # =========================
 # CONFIG
 # =========================
-DEFAULT_API_KEY = ""  # Leave blank in code; set via Streamlit Secrets (NEXTBILLION_API_KEY) or env var.
-DEFAULT_API_KEY = st.secrets.get("NEXTBILLION_API_KEY", os.getenv("NEXTBILLION_API_KEY", DEFAULT_API_KEY))
 NB_BASE = "https://api.nextbillion.io"
-UA = {"User-Agent": "NextBillion-Visual-Tester/1.0"}
+UA = {"User-Agent": "NextBillion-Routing-Testbench/1.0"}
 
-st.set_page_config(page_title="NextBillion.ai — Visual API Tester", layout="wide")
+st.set_page_config(page_title="NextBillion.ai — Routing Testbench", layout="wide")
+
+DEFAULT_API_KEY = st.secrets.get("NEXTBILLION_API_KEY", os.getenv("NEXTBILLION_API_KEY", ""))
+API_KEY_UI = st.sidebar.text_input("NextBillion API key", type="password", value=DEFAULT_API_KEY, help="Prefer Streamlit Secrets: NEXTBILLION_API_KEY")
+
 
 # =========================
-# AUDIT / DEBUG LOGGING
+# LIGHTWEIGHT LOGGING (perf-safe)
 # =========================
-
-# We log to:
-# 1) Console (visible in Streamlit Community Cloud → Manage app → Cloud logs)
-# 2) In-app sidebar panel (session-only)
-
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -50,293 +55,137 @@ def _mask_secret(s: str, keep_last: int = 4) -> str:
     return "*" * (len(s) - keep_last) + s[-keep_last:]
 
 
-def _safe_preview(v, max_len: int = 180):
-    """Small printable preview for logs; avoids dumping huge objects."""
-    try:
-        if isinstance(v, (int, float, bool)) or v is None:
-            return v
-        if isinstance(v, str):
-            return v if len(v) <= max_len else (v[:max_len] + "…")
-        if isinstance(v, (list, tuple)):
-            return {"type": type(v).__name__, "len": len(v)}
-        if isinstance(v, dict):
-            return {"type": "dict", "keys": list(v.keys())[:20], "len": len(v)}
-        return {"type": type(v).__name__}
-    except Exception:
-        return str(v)[:max_len]
-
-
-def init_audit_logger():
-    if "audit_events" not in st.session_state:
-        st.session_state.audit_events = []
+def _init_logger() -> logging.Logger:
     if "run_id" not in st.session_state:
         st.session_state.run_id = str(uuid.uuid4())[:8]
-    # Performance-friendly defaults (can be toggled in sidebar)
-    st.session_state.setdefault("audit_enabled", os.getenv("AUDIT_ENABLED", "0") == "1")
-    st.session_state.setdefault("audit_console", os.getenv("AUDIT_CONSOLE", "0") == "1")  # write ALL events to Cloud logs
-    st.session_state.setdefault("audit_state_diff", False)  # diff session_state on reruns (expensive)
-    st.session_state.setdefault("audit_sample_rate", 1)  # log 1 of N non-critical events
-    st.session_state.setdefault("audit_max_events", 600)  # in-app buffer size
+    if "audit_events" not in st.session_state:
+        st.session_state.audit_events = []
+    st.session_state.setdefault("audit_enabled", False)     # verbose events
+    st.session_state.setdefault("audit_state_diff", False)  # expensive
+    st.session_state.setdefault("audit_console_all", False) # cloud logs spam
+    st.session_state.setdefault("audit_max_events", 600)
 
-    logger = logging.getLogger("nextbillion_audit")
+    logger = logging.getLogger("nb_audit")
     if not logger.handlers:
         h = logging.StreamHandler()
-        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-        h.setFormatter(fmt)
+        h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
         logger.addHandler(h)
         logger.setLevel(logging.INFO)
         logger.propagate = False
     return logger
 
 
-AUDIT_LOG = init_audit_logger()
+LOG = _init_logger()
 
 
-def _should_log_event(event: str) -> bool:
-    # Always keep API and error signals
-    if event.startswith("api_") or event in {"button_clicked", "error"}:
-        return True
-    return bool(st.session_state.get("audit_enabled", False))
-
-
-def audit_event(event: str, **fields):
-    # Sampling for noisy events when audit is enabled
-    if not _should_log_event(event):
-        return
-
-    sample_n = int(st.session_state.get("audit_sample_rate", 1) or 1)
-    if sample_n > 1 and event not in {"button_clicked"} and not event.startswith("api_"):
-        # Cheap sampler: keep 1 of N
-        if (hash(event) ^ len(st.session_state.get("audit_events", []))) % sample_n != 0:
-            return
-
-    payload = {
-        "ts": _utc_now_iso(),
-        "run_id": st.session_state.get("run_id", ""),
-        "event": event,
-    }
-    for k, v in fields.items():
-        payload[k] = _safe_preview(v)
-
-    # Console logs (Community Cloud "Cloud logs") can be I/O heavy:
-    # default is only API + errors; can be turned on for all events via audit_console.
-    if event.startswith("api_") or event in {"error"} or bool(st.session_state.get("audit_console", False)):
-        AUDIT_LOG.info(json.dumps(payload, ensure_ascii=False))
-
-    # In-app session log (bounded)
+def audit(event: str, level: str = "INFO", force_console: bool = False, **fields):
+    """Logs to in-app buffer always; optionally to console (Cloud logs)."""
+    payload = {"ts": _utc_now_iso(), "run_id": st.session_state.get("run_id", ""), "event": event, **fields}
     st.session_state.audit_events.append(payload)
-    max_ev = int(st.session_state.get("audit_max_events", 600) or 600)
-    if len(st.session_state.audit_events) > max_ev:
-        st.session_state.audit_events = st.session_state.audit_events[-max_ev:]
+    if len(st.session_state.audit_events) > int(st.session_state.audit_max_events):
+        st.session_state.audit_events = st.session_state.audit_events[-int(st.session_state.audit_max_events):]
+
+    to_console = force_console or st.session_state.get("audit_console_all", False) or event.startswith("api_") or level == "ERROR"
+    if to_console:
+        msg = json.dumps(payload, ensure_ascii=False)
+        getattr(LOG, level.lower(), LOG.info)(msg)
 
 
-def audit_session_state_changes():
-    """Optional (expensive): diff session_state between runs for debugging."""
-    if not (st.session_state.get("audit_enabled", False) and st.session_state.get("audit_state_diff", False)):
-        # Keep snapshot minimal so enabling diff later works
-        if "audit_prev_snapshot" not in st.session_state:
-            st.session_state.audit_prev_snapshot = {}
+def audit_state_changes():
+    if not st.session_state.get("audit_state_diff", False):
         return
-
-    deny = {
-        "audit_events", "run_id", "audit_prev_snapshot",
-        "audit_enabled", "audit_console", "audit_state_diff", "audit_sample_rate", "audit_max_events",
-        # large payload buckets (avoid noisy diffs)
-        "last_geocode_json", "last_places_json", "last_directions_json", "last_optimize_json",
-        "region_results", "places_results",
-    }
-
-    prev = st.session_state.get("audit_prev_snapshot") or {}
-    # Only consider keys that are likely widgets / small values
-    cur = {}
-    for k in st.session_state.keys():
-        if k in deny:
+    snap_key = "_prev_state_snapshot"
+    prev = st.session_state.get(snap_key, {})
+    now = {}
+    # Only snapshot simple keys to avoid large diffs
+    for k, v in st.session_state.items():
+        if k.startswith("_"):
             continue
-        v = st.session_state.get(k)
-        # Skip large objects early
-        if isinstance(v, (dict, list, tuple)) and len(v) > 60:
-            continue
-        cur[k] = _safe_preview(v)
-
-    changed = []
-    for k, v in cur.items():
-        if prev.get(k) != v:
-            changed.append((k, prev.get(k), v))
-
-    for k, old, new in changed[:25]:
-        audit_event("state_change", key=k, old=old, new=new)
-
-    st.session_state.audit_prev_snapshot = cur
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            now[k] = v
+    # Diff
+    changed = {k: {"from": prev.get(k), "to": now.get(k)} for k in now.keys() if prev.get(k) != now.get(k)}
+    if changed:
+        audit("state_change", changes=changed)
+    st.session_state[snap_key] = now
 
 
-# IMPORTANT: prevent recursion by calling the original Streamlit button
-_ST_BUTTON = st.button
-
-def audit_button(label: str, *args, **kwargs) -> bool:
-    clicked = _ST_BUTTON(label, *args, **kwargs)
-    if clicked:
-        audit_event("button_clicked", label=label, key=kwargs.get("key"))
-    return clicked
-
-
-def render_audit_panel():
-    # Keep this panel lightweight: code inside expanders runs on every rerun,
-    # even when collapsed. (So avoid building huge strings unless requested.)
-    with st.sidebar.expander("🧪 Debug / Audit logs", expanded=False):
-        st.caption("Logs help debugging. Heavy logging can slow the app—toggle it on only when needed.")
-
-        st.checkbox("Enable debug logging", key="audit_enabled")
-        st.checkbox("Log ALL events to Cloud logs (noisy)", key="audit_console")
-        st.checkbox("Track widget/state diffs on reruns (expensive)", key="audit_state_diff")
-        st.number_input("Sample 1 of N non-critical events", min_value=1, max_value=50, value=int(st.session_state.get("audit_sample_rate", 1)), step=1, key="audit_sample_rate")
-        st.number_input("In-app log buffer size", min_value=100, max_value=2500, value=int(st.session_state.get("audit_max_events", 600)), step=100, key="audit_max_events")
-
-        if st.button("Show session logs (render)", key="audit_render_btn"):
-            st.session_state.audit_render = True
-
-        if st.session_state.get("audit_render", False):
-            show_n = st.number_input("Show last N events", min_value=10, max_value=500, value=80, step=10, key="audit_show_n")
-            ev = st.session_state.get("audit_events", [])[-int(show_n):]
-            # Simple table view (faster than rendering huge JSON strings)
-            if ev:
-                st.dataframe(pd.DataFrame(ev), width="stretch")
-            st.download_button(
-                "Download session logs (JSONL)",
-                data="\n".join(json.dumps(e, ensure_ascii=False) for e in st.session_state.get("audit_events", [])),
-                file_name=f"audit_{st.session_state.get('run_id','')}.jsonl",
-                mime="application/json",
-            )
-
-
-
-
-
-# Capture widget/state changes on each rerun (best-effort)
-audit_session_state_changes()
-
-
+audit_state_changes()
 
 
 # =========================
-# HELPERS
+# HTTP HELPERS
 # =========================
-def now_unix() -> int:
-    return int(time.time())
-
-
-def dt_to_unix(dt: datetime) -> int:
-    # treat naive as UTC
-    if dt.tzinfo is None:
-        return int(dt.replace(tzinfo=timezone.utc).timestamp())
-    return int(dt.timestamp())
-
-
-def fmt_seconds(sec: Optional[float]) -> str:
-    if sec is None:
-        return "-"
-    sec = float(sec)
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = int(sec % 60)
-    if h > 0:
-        return f"{h}h {m}m {s}s"
-    if m > 0:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-
-def fmt_meters(m: Optional[float]) -> str:
-    if m is None:
-        return "-"
-    m = float(m)
-    if m >= 1000:
-        return f"{m/1000:.2f} km"
-    return f"{m:.0f} m"
-
-
-def safe_get(d: Dict, path: List, default=None):
-    cur = d
-    for p in path:
-        try:
-            cur = cur[p]
-        except Exception:
-            return default
-    return cur
-
-
-def nb_get(path: str, params: Dict, timeout: int = 60) -> Tuple[int, Dict]:
+def _req(method: str, path: str, *, params: Optional[dict] = None, body: Optional[dict] = None, timeout: int = 45) -> requests.Response:
+    if not API_KEY_UI:
+        raise RuntimeError("Missing API key. Set NEXTBILLION_API_KEY in Streamlit Secrets or paste in sidebar.")
     url = f"{NB_BASE}{path}"
+    params = dict(params or {})
+    params["key"] = API_KEY_UI
 
-    # mask API key in logs
-    p = dict(params or {})
-    if "key" in p:
-        p["key"] = _mask_secret(p.get("key"))
+    safe_params = dict(params)
+    safe_params["key"] = _mask_secret(API_KEY_UI)
 
     t0 = time.time()
-    audit_event("api_get_start", path=path, params=p, timeout=timeout)
-
-    try:
-        r = requests.get(url, params=params, headers=UA, timeout=timeout)
-    except Exception as e:
-        audit_event("api_get_error", path=path, params=p, error=str(e))
-        return 0, {"error": str(e)}
-
-    ms = int((time.time() - t0) * 1000)
-    audit_event("api_get_end", path=path, status=r.status_code, ms=ms, bytes=len(r.text) if r.text else 0)
-
-    try:
-        return r.status_code, r.json()
-    except Exception:
-        return r.status_code, {"raw": r.text}
+    audit("api_request", method=method.upper(), url=url, params=safe_params, has_body=bool(body), force_console=True)
+    r = requests.request(method.upper(), url, params=params, json=body, headers=UA, timeout=timeout)
+    dt_ms = int((time.time() - t0) * 1000)
+    audit("api_response", method=method.upper(), url=str(r.url), status=r.status_code, latency_ms=dt_ms, bytes=len(r.content or b""), force_console=True)
+    return r
 
 
-def nb_post(path: str, params: Dict, body: Dict, timeout: int = 60) -> Tuple[int, Dict]:
-    url = f"{NB_BASE}{path}"
-
-    # mask API key in logs
-    p = dict(params or {})
-    if "key" in p:
-        p["key"] = _mask_secret(p.get("key"))
-
-    t0 = time.time()
-    audit_event("api_post_start", path=path, params=p, body=_safe_preview(body), timeout=timeout)
-
-    try:
-        r = requests.post(url, params=params, json=body, headers=UA, timeout=timeout)
-    except Exception as e:
-        audit_event("api_post_error", path=path, params=p, error=str(e))
-        return 0, {"error": str(e)}
-
-    ms = int((time.time() - t0) * 1000)
-    audit_event("api_post_end", path=path, status=r.status_code, ms=ms, bytes=len(r.text) if r.text else 0)
-
-    try:
-        return r.status_code, r.json()
-    except Exception:
-        return r.status_code, {"raw": r.text}
-
-def latlng_str(lat: float, lng: float) -> str:
-    return f"{lat:.6f},{lng:.6f}"
+def nb_geocode(query: str, country: str = "", limit: int = 5) -> dict:
+    params = {"q": query, "limit": limit}
+    if country:
+        params["country"] = country
+    r = _req("GET", "/geocode", params=params)
+    return r.json()
 
 
-def parse_latlng(s: str) -> Optional[Tuple[float, float]]:
-    if not s:
-        return None
-    s = s.strip()
-    if "," not in s:
-        return None
-    a, b = s.split(",", 1)
-    try:
-        return float(a.strip()), float(b.strip())
-    except Exception:
-        return None
+def nb_directions(coords: List[Tuple[float, float]], mode: str = "car", option: str = "fast", avoid: str = "") -> dict:
+    # Directions API expects "origin" and "destination" and optionally "waypoints".
+    origin = f"{coords[0][1]},{coords[0][0]}"       # lng,lat
+    destination = f"{coords[-1][1]},{coords[-1][0]}"
+    params = {"origin": origin, "destination": destination, "mode": mode, "option": option}
+    if len(coords) > 2:
+        # waypoints: lng,lat|lng,lat
+        params["waypoints"] = "|".join([f"{lng},{lat}" for (lat, lng) in coords[1:-1]])
+    if avoid:
+        params["avoid"] = avoid
+    r = _req("GET", "/directions", params=params)
+    return r.json()
 
 
-# Google polyline decode (precision 5)
-def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, float]]:
-    if not isinstance(polyline_str, str) or not polyline_str:
+def nb_optimize_create(payload: dict) -> dict:
+    # Route Optimization API (task)
+    r = _req("POST", "/optimization/v2", body=payload)
+    return r.json()
+
+
+def nb_optimize_result(task_id: str) -> dict:
+    r = _req("GET", "/optimization/v2/result", params={"id": task_id})
+    return r.json()
+
+
+def nb_cluster_create(payload: dict) -> dict:
+    # Clustering endpoint per docs: POST /clustering?key=... citeturn1view0
+    r = _req("POST", "/clustering", body=payload)
+    return r.json()
+
+
+def nb_cluster_result(task_id: str) -> dict:
+    # GET /clustering/result?id=...&key=... citeturn1view0
+    r = _req("GET", "/clustering/result", params={"id": task_id})
+    return r.json()
+
+
+# =========================
+# POLYLINE DECODER (polyline6 by default)
+# =========================
+def decode_polyline(polyline_str: str, precision: int = 6) -> List[Tuple[float, float]]:
+    """Decodes a Google-style encoded polyline string."""
+    if not polyline_str:
         return []
-
     index, lat, lng = 0, 0, 0
     coordinates = []
     factor = 10 ** precision
@@ -344,8 +193,6 @@ def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, 
     while index < len(polyline_str):
         shift, result = 0, 0
         while True:
-            if index >= len(polyline_str):
-                return coordinates
             b = ord(polyline_str[index]) - 63
             index += 1
             result |= (b & 0x1F) << shift
@@ -357,8 +204,6 @@ def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, 
 
         shift, result = 0, 0
         while True:
-            if index >= len(polyline_str):
-                return coordinates
             b = ord(polyline_str[index]) - 63
             index += 1
             result |= (b & 0x1F) << shift
@@ -372,1100 +217,640 @@ def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, 
     return coordinates
 
 
-def extract_route_coords(directions_json: Dict) -> List[Tuple[float, float]]:
+# =========================
+# DEFAULT DATA
+# =========================
+def default_stops_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"stop_id": "S1", "address": "Jaipur Junction Railway Station", "lat": 26.9196, "lng": 75.7873, "tw_start": "09:00", "tw_end": "18:00"},
+            {"stop_id": "S2", "address": "Mansarovar, Jaipur", "lat": 26.8531, "lng": 75.7644, "tw_start": "10:00", "tw_end": "16:00"},
+            {"stop_id": "S3", "address": "Vaishali Nagar, Jaipur", "lat": 26.9066, "lng": 75.7385, "tw_start": "09:30", "tw_end": "17:30"},
+            {"stop_id": "S4", "address": "Malviya Nagar, Jaipur", "lat": 26.8538, "lng": 75.8120, "tw_start": "11:00", "tw_end": "18:00"},
+        ]
+    )
+
+
+def default_depots_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"depot_id": "D1", "name": "Default Depot", "lat": 26.9124, "lng": 75.7873},
+        ]
+    )
+
+
+def hhmm_to_seconds(s: str) -> int:
+    """Convert HH:MM to seconds from midnight."""
+    try:
+        hh, mm = s.strip().split(":")
+        return int(hh) * 3600 + int(mm) * 60
+    except Exception:
+        return 0
+
+
+def seconds_to_hhmm(secs: int) -> str:
+    secs = max(0, int(secs))
+    hh = (secs // 3600) % 24
+    mm = (secs % 3600) // 60
+    return f"{hh:02d}:{mm:02d}"
+
+
+# =========================
+# SESSION INIT
+# =========================
+if "stops_df" not in st.session_state:
+    st.session_state.stops_df = default_stops_df()
+if "depots_df" not in st.session_state:
+    st.session_state.depots_df = default_depots_df()
+
+st.title("NextBillion.ai — Multi‑Driver Routing Testbench")
+st.caption("Build stops → configure 25 drivers → optimize (time windows supported) → compare directions before/after → export JSONs.")
+
+# Sidebar controls
+with st.sidebar:
+    st.subheader("Run settings")
+    mode = st.selectbox("Planner mode", ["Direct VRP (25 drivers)", "Single route (1 driver)"], index=0)
+
+    return_to_start = st.checkbox("Round trip (return to depot)", value=True,
+                                  help="When enabled, vehicle end_index is same as start_index (depot). When disabled, routes are open. The Route Optimization API supports start_index and end_index. citeturn1view1")
+
+    objective = st.selectbox("Optimization objective (travel_cost)", ["duration", "distance"], index=0,
+                             help="Controls what the solver tries to minimize (time vs distance).")
+
+    # Directions settings
+    st.subheader("Directions settings")
+    directions_mode = st.selectbox("Directions mode", ["car", "truck"], index=0)
+    directions_option = st.selectbox("Directions option", ["fast", "flexible"], index=0)
+    avoid = st.text_input("Avoid (comma-separated)", value="", help="Examples: tolls,highways. citeturn0search2")
+
+    # Debug toggles
+    st.subheader("Debug")
+    st.session_state.audit_enabled = st.toggle("Enable verbose audit (slower)", value=st.session_state.audit_enabled)
+    st.session_state.audit_state_diff = st.toggle("Track widget state diffs (slow)", value=st.session_state.audit_state_diff)
+    st.session_state.audit_console_all = st.toggle("Log ALL events to Cloud logs (slow)", value=st.session_state.audit_console_all)
+
+
+tabs = st.tabs(["Stops", "Depots / Drivers", "Optimize", "Results", "Clustering (raw)", "Logs"])
+
+# -------------------------
+# Stops tab
+# -------------------------
+with tabs[0]:
+    st.subheader("Stops")
+    st.write("Edit stops here. For time windows, use HH:MM (same-day).")
+    df = st.session_state.stops_df.copy()
+
+    edited = st.data_editor(
+        df,
+        num_rows="dynamic",
+        width="stretch",
+        key="stops_editor",
+        column_config={
+            "stop_id": st.column_config.TextColumn(required=True),
+            "address": st.column_config.TextColumn(),
+            "lat": st.column_config.NumberColumn(format="%.6f"),
+            "lng": st.column_config.NumberColumn(format="%.6f"),
+            "tw_start": st.column_config.TextColumn(help="HH:MM"),
+            "tw_end": st.column_config.TextColumn(help="HH:MM"),
+        },
+    )
+    st.session_state.stops_df = edited
+
+    colA, colB, colC = st.columns([1, 1, 2])
+    with colA:
+        if st.button("Reset sample stops", width="content"):
+            st.session_state.stops_df = default_stops_df()
+            audit("button_clicked", widget="reset_sample_stops")
+            st.rerun()
+
+    with colB:
+        country = st.text_input("Country filter (optional)", value="IN", help="Helps geocode precision.")
+    with colC:
+        st.write("Geocode helper: enter an address and click search.")
+        q = st.text_input("Geocode query", value="", key="geocode_query")
+        if st.button("Geocode lookup", width="content"):
+            audit("button_clicked", widget="geocode_lookup", query=q)
+            try:
+                res = nb_geocode(q, country=country.strip(), limit=5)
+                st.session_state.last_geocode_json = res
+                st.json(res)
+            except Exception as e:
+                audit("error", where="geocode_lookup", msg=str(e), level="ERROR")
+                st.error(str(e))
+
+    if st.session_state.get("last_geocode_json"):
+        st.download_button(
+            "Download last Geocode JSON",
+            data=json.dumps(st.session_state.last_geocode_json, ensure_ascii=False),
+            file_name="geocode_last.json",
+            mime="application/json",
+            width="content",
+        )
+
+# -------------------------
+# Depots / Drivers tab
+# -------------------------
+with tabs[1]:
+    st.subheader("Depots & Driver setup")
+
+    depots_df = st.session_state.depots_df.copy()
+    st.write("Add one or more candidate depots. For multi-depot testing, add several.")
+    depots_edit = st.data_editor(
+        depots_df,
+        num_rows="dynamic",
+        width="stretch",
+        key="depots_editor",
+        column_config={
+            "depot_id": st.column_config.TextColumn(required=True),
+            "name": st.column_config.TextColumn(),
+            "lat": st.column_config.NumberColumn(format="%.6f"),
+            "lng": st.column_config.NumberColumn(format="%.6f"),
+        },
+    )
+    st.session_state.depots_df = depots_edit
+
+    st.divider()
+    st.subheader("Driver / Vehicle generator (testing)")
+    driver_count = st.number_input("Number of drivers (vehicles)", min_value=1, max_value=200, value=25, step=1)
+    shift_start = st.text_input("Shift start (HH:MM)", value="09:00")
+    shift_end = st.text_input("Shift end (HH:MM)", value="18:00")
+
+    depot_mode = st.selectbox(
+        "Depot mode",
+        ["Single depot for all drivers (use first depot)", "Random depot per driver (from list)", "Open route: start at first job (no depot)"],
+        index=0,
+        help="Route Optimization supports specifying vehicle start/end locations via start_index/end_index (location list indices). citeturn1view1",
+    )
+
+    st.info(
+        "Note on 'depot can change': the solver won’t invent depot locations — it can only use the depot candidates you provide. "
+        "So 'dynamic depot' = choose from your depot list (random or per driver), or use open routes."
+    )
+
+# -------------------------
+# Optimize tab
+# -------------------------
+def build_vrp_payload(
+    stops: pd.DataFrame,
+    depots: pd.DataFrame,
+    *,
+    mode: str,
+    driver_count: int,
+    depot_mode: str,
+    return_to_start: bool,
+    objective: str,
+    shift_start: str,
+    shift_end: str,
+) -> Tuple[dict, List[Tuple[float, float]], Dict[int, str]]:
     """
-    NextBillion Directions can resemble Google-like responses, but fields vary.
-    We try multiple known shapes to reliably extract a polyline:
-    - routes[0].geometry (encoded polyline)
-    - routes[0].overview_polyline.points
-    - routes[0].polyline / routes[0].points
-    - legs/steps geometries (fallback)
+    Returns:
+    - payload for /optimization/v2
+    - locations list (lat,lng) in index order
+    - location_index -> label mapping for UI
     """
-    routes = directions_json.get("routes") or []
-    if not routes:
+    # Build locations list: [depots..., stops...]
+    locs: List[Tuple[float, float]] = []
+    loc_labels: Dict[int, str] = {}
+
+    # Depots first
+    for _, d in depots.iterrows():
+        loc_labels[len(locs)] = f"DEPOT:{d.get('depot_id','')}"
+        locs.append((float(d["lat"]), float(d["lng"])))
+
+    depot_count = len(locs)
+
+    # Stops next
+    for _, s in stops.iterrows():
+        loc_labels[len(locs)] = f"STOP:{s.get('stop_id','')}"
+        locs.append((float(s["lat"]), float(s["lng"])))
+
+    # Jobs reference stop locations by index
+    jobs = []
+    for i, s in enumerate(stops.itertuples(index=False), start=0):
+        location_index = depot_count + i
+        tw_start = hhmm_to_seconds(getattr(s, "tw_start", "") or "00:00")
+        tw_end = hhmm_to_seconds(getattr(s, "tw_end", "") or "23:59")
+        # Route Optimization API jobs can include time_windows; schema described in docs. citeturn1view1
+        jobs.append(
+            {
+                "id": int(i + 1),  # must be non-zero positive int in many NB APIs
+                "location_index": int(location_index),
+                "service": 0,  # no service time (your requirement)
+                "time_windows": [[int(tw_start), int(tw_end)]],
+            }
+        )
+
+    # Vehicles
+    vehicles = []
+    ss = hhmm_to_seconds(shift_start)
+    se = hhmm_to_seconds(shift_end)
+    if se <= ss:
+        se = ss + 8 * 3600
+
+    def pick_start_index(v_i: int) -> Optional[int]:
+        if depot_mode.startswith("Open route"):
+            return None
+        if depot_count <= 0:
+            return None
+        if depot_mode.startswith("Random depot"):
+            return int(v_i % depot_count)
+        return 0
+
+    for v in range(int(driver_count)):
+        start_idx = pick_start_index(v)
+        # end_idx logic: if open route -> omit; else round trip vs open
+        if start_idx is None:
+            # open route with no explicit depot
+            veh = {"id": int(v + 1)}
+        else:
+            end_idx = int(start_idx) if return_to_start else int(start_idx)  # for open routes with depot, we still set end_index below
+            # If not returning to depot, leave end_index unspecified to allow solver to end at last job.
+            veh = {"id": int(v + 1), "start_index": int(start_idx)}
+            if return_to_start:
+                veh["end_index"] = int(start_idx)
+        # Shift window (vehicle availability)
+        veh["time_window"] = [int(ss), int(se)]
+        vehicles.append(veh)
+
+    payload = {
+        "description": f"Routing testbench | {mode} | drivers={driver_count}",
+        "locations": {"id": 1, "location": [[lng, lat] for (lat, lng) in locs]},  # NB uses [lng,lat] in many APIs
+        "jobs": jobs,
+        "vehicles": vehicles,
+        "options": {"objective": {"travel_cost": objective}},
+    }
+
+    return payload, locs, loc_labels
+
+
+def parse_vrp_routes(opt_result: dict) -> List[dict]:
+    """
+    Attempts to parse routes from 'result' which may be JSON string.
+    """
+    if not opt_result:
         return []
-
-    r0 = routes[0]
-
-    # common direct fields
-    geom = r0.get("geometry")
-    if isinstance(geom, str) and geom:
-        return decode_polyline(geom, precision=5)
-
-    ov = r0.get("overview_polyline")
-    if isinstance(ov, dict):
-        pts = ov.get("points")
-        if isinstance(pts, str) and pts:
-            return decode_polyline(pts, precision=5)
-
-    poly = r0.get("polyline") or r0.get("points")
-    if isinstance(poly, str) and poly:
-        return decode_polyline(poly, precision=5)
-
-    # fallback: stitch step geometries if present
-    coords: List[Tuple[float, float]] = []
-    legs = r0.get("legs") or []
-    for leg in legs:
-        steps = leg.get("steps") or []
-        for stp in steps:
-            g = stp.get("geometry") or stp.get("polyline")
-            if isinstance(g, str) and g:
-                part = decode_polyline(g, precision=5)
-                if part:
-                    if coords and part and coords[-1] == part[0]:
-                        coords.extend(part[1:])
-                    else:
-                        coords.extend(part)
-    return coords
+    r = opt_result.get("result")
+    if isinstance(r, str):
+        try:
+            r = json.loads(r)
+        except Exception:
+            return []
+    if not isinstance(r, dict):
+        return []
+    return r.get("routes", []) or []
 
 
-def infer_center(stops: List[Dict], fallback: Tuple[float, float]) -> Tuple[float, float]:
-    pts = [(s["lat"], s["lng"]) for s in stops if s.get("lat") is not None and s.get("lng") is not None]
-    if not pts:
-        return fallback
-    return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
-
-
-def numbered_icon(num: int) -> folium.DivIcon:
-    html = f"""
-    <div style="
-        width: 28px; height: 28px;
-        background: #e53935;
-        border-radius: 50%;
-        border: 2px solid white;
-        color: white;
-        text-align: center;
-        line-height: 24px;
-        font-weight: 700;
-        font-size: 13px;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.35);
-    ">{num}</div>
-    """
-    return folium.DivIcon(html=html)
-
-
-def build_map(
-    center: Tuple[float, float],
-    stops: List[Dict],
-    route_coords: Optional[List[Tuple[float, float]]] = None,
-    zoom: int = 11,
-    show_arrows: bool = True,
-) -> folium.Map:
-    m = folium.Map(location=[center[0], center[1]], zoom_start=zoom, control_scale=True)
-
-    # numbered red pins (order matters)
-    for i, s in enumerate(stops):
-        if s.get("lat") is None or s.get("lng") is None:
+def route_steps_to_location_indices(route: dict) -> List[int]:
+    steps = route.get("steps", []) or []
+    out = []
+    for s in steps:
+        # Steps contain either location_index or embedded location index. Existing NextBillion examples include location_index.
+        li = s.get("location_index")
+        if li is None and "job" in s:
+            # sometimes job steps have job id; not enough to map without lookup
             continue
-        label = s.get("label") or f"Stop {i+1}"
-        addr = s.get("address") or ""
-        popup = f"<b>{label}</b><br/>{addr}<br/>{s['lat']:.6f}, {s['lng']:.6f}"
+        if li is not None:
+            out.append(int(li))
+    # Deduplicate consecutive duplicates
+    cleaned = []
+    for x in out:
+        if not cleaned or cleaned[-1] != x:
+            cleaned.append(x)
+    return cleaned
+
+
+with tabs[2]:
+    st.subheader("Optimize")
+    stops = st.session_state.stops_df.copy()
+    depots = st.session_state.depots_df.copy()
+
+    if len(stops) < 2:
+        st.warning("Add at least 2 stops to optimize.")
+    else:
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("Create optimization job", width="stretch"):
+                audit("button_clicked", widget="create_optimization_job")
+                try:
+                    payload, locs, loc_labels = build_vrp_payload(
+                        stops,
+                        depots,
+                        mode=mode,
+                        driver_count=1 if mode.startswith("Single") else int(driver_count),
+                        depot_mode=depot_mode,
+                        return_to_start=return_to_start,
+                        objective=objective,
+                        shift_start=shift_start,
+                        shift_end=shift_end,
+                    )
+                    st.session_state.last_opt_create_payload = payload
+                    res = nb_optimize_create(payload)
+                    st.session_state.last_opt_create_json = res
+                    task_id = res.get("id") or res.get("task_id")
+                    st.session_state.last_opt_task_id = task_id
+                    st.success(f"Optimization job created: {task_id}")
+                    st.json(res)
+                except Exception as e:
+                    audit("error", where="create_optimization_job", msg=str(e), level="ERROR")
+                    st.error(str(e))
+
+        with col2:
+            if st.button("Fetch optimization result", width="stretch"):
+                audit("button_clicked", widget="fetch_optimization_result")
+                try:
+                    task_id = st.session_state.get("last_opt_task_id")
+                    if not task_id:
+                        st.error("No task id yet. Create job first.")
+                    else:
+                        res = nb_optimize_result(task_id)
+                        st.session_state.last_opt_result_json = res
+                        st.json(res)
+                except Exception as e:
+                    audit("error", where="fetch_optimization_result", msg=str(e), level="ERROR")
+                    st.error(str(e))
+
+        # Downloads
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.session_state.get("last_opt_create_payload"):
+                st.download_button(
+                    "Download last Optimization Create Payload",
+                    data=json.dumps(st.session_state.last_opt_create_payload, ensure_ascii=False),
+                    file_name="opt_create_last.json",
+                    mime="application/json",
+                    width="content",
+                )
+        with c2:
+            if st.session_state.get("last_opt_result_json"):
+                st.download_button(
+                    "Download last Optimization Result JSON",
+                    data=json.dumps(st.session_state.last_opt_result_json, ensure_ascii=False),
+                    file_name="opt_result_last.json",
+                    mime="application/json",
+                    width="content",
+                )
+
+# -------------------------
+# Results tab (map + fair compare)
+# -------------------------
+def compute_directions_metrics(d: dict) -> Tuple[float, float]:
+    """Return (distance_m, duration_s) for first route."""
+    if not d or d.get("status") != "Ok":
+        return (0.0, 0.0)
+    r0 = (d.get("routes") or [{}])[0]
+    return float(r0.get("distance", 0.0)), float(r0.get("duration", 0.0))
+
+
+def build_baseline_order(stops: pd.DataFrame, depots: pd.DataFrame, return_to_start: bool, depot_mode: str) -> List[Tuple[float, float]]:
+    coords = [(float(x["lat"]), float(x["lng"])) for _, x in stops.iterrows()]
+    if depot_mode.startswith("Open route"):
+        # no explicit depot; baseline is just stops in given order
+        if return_to_start:
+            # round trip requested but no depot: close at first stop
+            coords = coords + [coords[0]]
+        return coords
+
+    # Use first depot as baseline depot
+    if len(depots) == 0:
+        if return_to_start:
+            coords = coords + [coords[0]]
+        return coords
+
+    depot = (float(depots.iloc[0]["lat"]), float(depots.iloc[0]["lng"]))
+    if return_to_start:
+        return [depot] + coords + [depot]
+    else:
+        # open route: start at depot, end at last stop
+        return [depot] + coords
+
+
+def folium_map_for_route(coords: List[Tuple[float, float]], geometry: str = "", labels: Optional[List[str]] = None) -> folium.Map:
+    if not coords:
+        return folium.Map(location=[0, 0], zoom_start=2)
+
+    m = folium.Map(location=[coords[0][0], coords[0][1]], zoom_start=12)
+    # markers
+    for i, (lat, lng) in enumerate(coords):
+        label = labels[i] if labels and i < len(labels) else f"{i}"
         folium.Marker(
-            [s["lat"], s["lng"]],
-            popup=popup,
-            tooltip=f"{i+1}. {label}",
-            icon=numbered_icon(i + 1),
+            [lat, lng],
+            tooltip=label,
+            icon=folium.DivIcon(html=f"""
+                <div style="font-size: 12px; color: white; background: #017dff;
+                            border-radius: 999px; width: 24px; height: 24px;
+                            display:flex; align-items:center; justify-content:center;
+                            border:2px solid white; box-shadow:0 1px 3px rgba(0,0,0,.35);">
+                    {i}
+                </div>
+            """),
         ).add_to(m)
 
-    # route polyline + arrows
-    if route_coords and len(route_coords) >= 2:
-        pl = folium.PolyLine(route_coords, weight=6, opacity=0.9)
+    # polyline from geometry (preferred) or straight lines
+    pts = decode_polyline(geometry, precision=6) if geometry else coords
+    if pts and len(pts) >= 2:
+        pl = folium.PolyLine(pts, weight=5, opacity=0.8)
         pl.add_to(m)
-
-        if show_arrows:
-            # repeat arrowheads along the line
-            PolyLineTextPath(
-                pl,
-                "▶",
-                repeat=True,
-                offset=7,
-                attributes={"font-size": "16", "fill": "#111", "font-weight": "700"},
-            ).add_to(m)
-
+        try:
+            PolyLineTextPath(pl, "➤", repeat=True, offset=7, attributes={"font-size": "16", "fill": "black"}).add_to(m)
+        except Exception:
+            pass
     return m
 
 
-def ensure_state():
-    if "api_key" not in st.session_state:
-        st.session_state.api_key = DEFAULT_API_KEY
-
-    if "center" not in st.session_state:
-        st.session_state.center = (28.6139, 77.2090)  # New Delhi
-
-    if "country_filter" not in st.session_state:
-        st.session_state.country_filter = "IND"
-
-    if "stops" not in st.session_state:
-        st.session_state.stops = []
-
-    # persistence buckets
-    for k in [
-        "region_results",
-        "places_results",
-        "last_geocode_json",
-        "last_places_json",
-        "last_directions_json_before",
-        "last_directions_json_after",
-        "last_matrix_json",
-        "last_snap_json",
-        "last_iso_json",
-        "last_opt_create_json",
-        "last_opt_result_json",
-        "before_metrics",
-        "after_metrics",
-        "before_route_coords",
-        "after_route_coords",
-        "vrp_job_id",
-        "map_click",
-        "map_version",
-    ]:
-        if k not in st.session_state:
-            st.session_state[k] = None
-
-    if st.session_state.map_version is None:
-        st.session_state.map_version = 1
-
-
-ensure_state()
-
-
-# =========================
-# CACHING
-# =========================
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_forward_geocode(api_key: str, query: str, country_code: Optional[str], lang: str):
-    params = {"key": api_key, "q": query, "language": lang}
-    if country_code:
-        params["countryCode"] = country_code
-    return nb_get("/geocode", params=params, timeout=60)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_reverse_geocode(api_key: str, lat: float, lng: float, lang: str):
-    params = {"key": api_key, "at": latlng_str(lat, lng), "language": lang}
-    return nb_get("/reversegeocode", params=params, timeout=60)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_places_discover(api_key: str, at: str, q: str, radius: int, limit: int, country_filter: Optional[str], lang: str):
-    # Docs confirm /discover endpoint.  :contentReference[oaicite:2]{index=2}
-    params = {"key": api_key, "at": at, "q": q, "limit": limit, "language": lang}
-    if radius:
-        params["radius"] = radius
-    if country_filter:
-        params["in"] = f"countryCode:{country_filter}"
-    return nb_get("/discover", params=params, timeout=60)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_directions(api_key: str, origin: str, destination: str, waypoints: str, mode: str, option: str,
-                      avoid: str, alternatives: bool, departure_time: Optional[int], route_type: str, lang: str):
-    params = {"key": api_key, "origin": origin, "destination": destination, "mode": mode, "language": lang}
-
-    if option == "flexible":
-        params["option"] = "flexible"
-        if route_type:
-            params["route_type"] = route_type
-
-    if waypoints:
-        params["waypoints"] = waypoints
-    if avoid:
-        params["avoid"] = avoid
-    if alternatives:
-        params["alternatives"] = "true"
-    if departure_time:
-        params["departure_time"] = int(departure_time)
-
-    return nb_get("/directions/json", params=params, timeout=60)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_distance_matrix(api_key: str, origins: str, destinations: str, mode: str, option: str,
-                           avoid: str, departure_time: Optional[int], route_type: str, lang: str):
-    params = {"key": api_key, "origins": origins, "destinations": destinations, "mode": mode, "language": lang}
-    if option == "flexible":
-        params["option"] = "flexible"
-        if route_type:
-            params["route_type"] = route_type
-    if avoid:
-        params["avoid"] = avoid
-    if departure_time:
-        params["departure_time"] = int(departure_time)
-    return nb_get("/distancematrix/json", params=params, timeout=60)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_snap_to_roads(api_key: str, path_str: str, radiuses: Optional[str], timestamps: Optional[str], mode: str, geometry: str):
-    params = {"key": api_key, "path": path_str, "mode": mode}
-    if radiuses:
-        params["radiuses"] = radiuses
-    if timestamps:
-        params["timestamps"] = timestamps
-    if geometry:
-        params["geometry"] = geometry
-    return nb_get("/snapToRoads/json", params=params, timeout=60)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_isochrone(api_key: str, coordinates: str, mode: str, contours_minutes: str, departure_time: Optional[int]):
-    params = {"key": api_key, "coordinates": coordinates, "mode": mode, "contours_minutes": contours_minutes}
-    if departure_time:
-        params["departure_time"] = int(departure_time)
-    return nb_get("/isochrone/json", params=params, timeout=60)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_vrp_create(api_key: str, body: Dict):
-    return nb_post("/optimization/v2", params={"key": api_key}, body=body, timeout=90)
-
-
-def vrp_result_no_cache(api_key: str, job_id: str) -> Tuple[int, Dict]:
-    # No caching: needed for polling until ready
-    return nb_get("/optimization/v2/result", params={"key": api_key, "id": job_id}, timeout=90)
-
-
-# =========================
-# UI — SIDEBAR GLOBAL OPTIONS
-# =========================
-st.sidebar.title("Config")
-render_audit_panel()
-
-st.session_state.api_key = st.sidebar.text_input(
-    "NextBillion API Key",
-    value=st.session_state.api_key,
-    type="password",
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Stops (20+ supported)")
-st.sidebar.caption("Stops are shared across ALL tabs.")
-
-lang = st.sidebar.selectbox("Language", ["en-US", "en", "de", "fr", "hi"], index=0)
-mode = st.sidebar.selectbox("Mode", ["car", "truck", "motorbike", "bicycle", "pedestrian"], index=0)
-option = st.sidebar.selectbox("Directions/Matrix option", ["fast", "flexible"], index=0)
-
-route_type = ""
-if option == "flexible":
-    route_type = st.sidebar.selectbox("Route type (flexible)", ["", "fastest", "shortest"], index=1)
-
-# Avoid dropdown
-avoid_choices = {
-    "None": "",
-    "Avoid tolls": "toll",
-    "Avoid highways": "highway",
-    "Avoid ferries": "ferry",
-    "Avoid highways + tolls": "highway|toll",
-    "Avoid ferries + tolls": "ferry|toll",
-    "Avoid ferries + highways": "ferry|highway",
-    "Avoid ferries + highways + tolls": "ferry|highway|toll",
-}
-avoid_label = st.sidebar.selectbox("Avoid", list(avoid_choices.keys()), index=0)
-avoid = avoid_choices[avoid_label]
-
-alternatives = st.sidebar.checkbox("Alternative routes", value=False)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Departure time (optional)")
-dep_dt = st.sidebar.date_input("Date", value=datetime.now().date())
-dep_tm = st.sidebar.time_input("Time", value=datetime.now().time().replace(microsecond=0))
-use_departure = st.sidebar.checkbox("Use departure_time", value=False)
-
-departure_unix = None
-if use_departure:
-    dep = datetime(dep_dt.year, dep_dt.month, dep_dt.day, dep_tm.hour, dep_tm.minute, dep_tm.second)
-    departure_unix = dt_to_unix(dep)
-    st.sidebar.caption(f"departure_time: {departure_unix}  ({dep} UTC)")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Stops loaded")
-st.sidebar.write(len(st.session_state.stops))
-
-
-# =========================
-# HEADER
-# =========================
-st.title("NextBillion.ai — Visual API Tester")
-st.caption("Workflow: search region → set center → generate stops → compute route (before) → optimize (after) → compare savings")
-
-tabs = st.tabs([
-    "Stop Manager (Search + Generate 20+)",
-    "Geocode & Map",
-    "Places (POI Search → Add Stops)",
-    "Route + Optimize (Before vs After)",
-    "Distance Matrix (NxN)",
-    "Snap-to-Roads + Isochrone",
-])
-
-
-# =========================
-# TAB 0 — STOP MANAGER
-# =========================
-with tabs[0]:
-    st.subheader("1) Pick a region/city → set center → generate stops (no keyword required)")
-    c1, c2 = st.columns([1, 1], gap="large")
-
-    with c1:
-        st.markdown("### A) Search region/city/state/country (universal)")
-        st.caption("Uses Forward Geocode for region search. Only runs when you click Search.")
-
-        with st.form("region_search_form", clear_on_submit=False):
-            region_q = st.text_input("Region/City/State/Country", value="Delhi")
-            country_hint = st.text_input("Country hint (optional, 3-letter code like IND/DEU/USA)", value="")
-            submitted_region = st.form_submit_button("Search Region")
-
-        if submitted_region and region_q.strip():
-            status, data = cached_forward_geocode(
-                st.session_state.api_key,
-                region_q.strip(),
-                country_hint.strip() if country_hint.strip() else None,
-                lang,
-            )
-            st.session_state.last_geocode_json = data
-            st.write(f"Geocode response: HTTP {status}")
-
-            items = data.get("items") or data.get("results") or []
-            region_results = []
-            for it in items[:15]:
-                pos = it.get("position") or {}
-                title = it.get("title") or it.get("address", {}).get("label") or str(it.get("id", "result"))
-                cc = (it.get("address", {}) or {}).get("countryCode") or it.get("countryCode")
-                region_results.append({
-                    "title": title,
-                    "lat": pos.get("lat"),
-                    "lng": pos.get("lng"),
-                    "countryCode": cc,
-                    "raw": it,
-                })
-            st.session_state.region_results = region_results
-
-        # Persist selection even after reruns
-        if st.session_state.region_results:
-            pick = st.selectbox(
-                "Pick a region result",
-                options=list(range(len(st.session_state.region_results))),
-                format_func=lambda i: f"{st.session_state.region_results[i]['title']} ({st.session_state.region_results[i]['countryCode'] or '-'})",
-                key="region_pick_selectbox",
-            )
-            if audit_button("Use picked region as center"):
-                chosen = st.session_state.region_results[pick]
-                if chosen.get("lat") is not None and chosen.get("lng") is not None:
-                    st.session_state.center = (chosen["lat"], chosen["lng"])
-                    if chosen.get("countryCode"):
-                        st.session_state.country_filter = chosen["countryCode"]
-                    st.session_state.map_version += 1
-                    st.success(f"Center set: {st.session_state.center} | Country filter: {st.session_state.country_filter}")
-                else:
-                    st.error("Selected result has no lat/lng. Try another result.")
-
-        st.markdown("### B) Paste stops (easy input)")
-        input_mode = st.radio("Input type", ["Addresses (one per line)", "Lat,Lng (one per line)"], horizontal=True)
-
-        pasted = st.text_area("Paste at least 20 lines", height=180, placeholder="Example:\nConnaught Place, New Delhi\nIGI Airport, Delhi\n...")
-
-        colA, colB = st.columns(2)
-        with colA:
-            if audit_button("Add / Replace Stops"):
-                lines = [x.strip() for x in pasted.splitlines() if x.strip()]
-                new_stops = []
-                for i, line in enumerate(lines):
-                    if input_mode.startswith("Lat"):
-                        ll = parse_latlng(line)
-                        if not ll:
-                            continue
-                        new_stops.append({"label": f"Stop {i+1}", "address": "", "lat": ll[0], "lng": ll[1], "source": "pasted_latlng"})
-                    else:
-                        new_stops.append({"label": f"Stop {i+1}", "address": line, "lat": None, "lng": None, "source": "pasted_address"})
-                st.session_state.stops = new_stops
-                st.success(f"Loaded {len(st.session_state.stops)} stops")
-        with colB:
-            if audit_button("Clear Stops"):
-                st.session_state.stops = []
-                st.success("Stops cleared")
-
-    with c2:
-        st.markdown("### C) Set center by clicking on the map (pin shows immediately)")
-        st.caption("Click the map → a red pin appears. Then press 'Use clicked point as center'.")
-
-        center = st.session_state.center
-        pick_map = folium.Map(location=[center[0], center[1]], zoom_start=11, control_scale=True)
-        folium.Marker([center[0], center[1]], tooltip="Current center", icon=folium.Icon(color="blue")).add_to(pick_map)
-
-        # If user already clicked, show that pin too
-        if st.session_state.map_click:
-            folium.Marker(
-                [st.session_state.map_click[0], st.session_state.map_click[1]],
-                tooltip="Clicked point",
-                icon=folium.Icon(color="red", icon="map-marker"),
-            ).add_to(pick_map)
-
-        map_click = st_folium(
-            pick_map,
-            height=420,
-            use_container_width=True,
-            key=f"pick_center_map_v{st.session_state.map_version}",
-        )
-        clicked = map_click.get("last_clicked")
-        if clicked:
-            st.session_state.map_click = (clicked["lat"], clicked["lng"])
-            st.info(f"Clicked: {clicked['lat']:.6f}, {clicked['lng']:.6f}")
-
-        if audit_button("Use clicked point as center"):
-            if st.session_state.map_click:
-                st.session_state.center = st.session_state.map_click
-                st.session_state.map_version += 1
-                st.success(f"Center updated: {st.session_state.center}")
-
-        st.markdown("### D) Generate random stops around center (NO keyword required)")
-        st.caption("Generates random lat/lng. Optional reverse-geocode first N into human-readable addresses.")
-
-        with st.form("random_gen_form", clear_on_submit=False):
-            n = st.number_input("How many stops?", min_value=5, max_value=200, value=25, step=1)
-            radius_m = st.number_input("Radius (meters)", min_value=200, max_value=50000, value=8000, step=100)
-            resolve_n = st.number_input("Reverse-geocode first N (optional)", min_value=0, max_value=200, value=0, step=1)
-            gen = st.form_submit_button("Generate Stops Around Center")
-
-        if gen:
-            cx, cy = st.session_state.center
-            new_stops = []
-            for i in range(int(n)):
-                r = radius_m * math.sqrt(random.random())
-                theta = 2 * math.pi * random.random()
-                dx = r * math.cos(theta)
-                dy = r * math.sin(theta)
-
-                dlat = dy / 111320.0
-                dlng = dx / (111320.0 * math.cos(math.radians(cx)) + 1e-9)
-
-                lat = cx + dlat
-                lng = cy + dlng
-                new_stops.append({"label": f"Stop {i+1}", "address": "", "lat": lat, "lng": lng, "source": "random"})
-
-            if resolve_n and resolve_n > 0:
-                for i in range(min(int(resolve_n), len(new_stops))):
-                    status, data = cached_reverse_geocode(st.session_state.api_key, new_stops[i]["lat"], new_stops[i]["lng"], lang)
-                    items = data.get("items") or data.get("results") or []
-                    if items:
-                        it0 = items[0]
-                        label = it0.get("title") or (it0.get("address", {}) or {}).get("label") or ""
-                        new_stops[i]["address"] = label
-
-            st.session_state.stops = new_stops
-            st.session_state.map_version += 1
-            st.success(f"Generated {len(st.session_state.stops)} stops around {st.session_state.center}")
-
-        st.markdown("### Stops table (editable)")
-        df = pd.DataFrame(st.session_state.stops)
-        edited = st.data_editor(df, num_rows="dynamic", width="stretch", key="stops_editor")
-        st.session_state.stops = edited.to_dict(orient="records")
-
-        st.markdown("### Stops map (red numbered pins)")
-        center2 = infer_center(st.session_state.stops, st.session_state.center)
-        m = build_map(center2, st.session_state.stops, zoom=11, show_arrows=False)
-        st_folium(m, height=520, use_container_width=True, key=f"stops_overview_map_v{st.session_state.map_version}")
-
-
-# =========================
-# TAB 1 — GEOCODE & MAP
-# =========================
-with tabs[1]:
-    st.subheader("2) Geocode addresses → show pins on map (cached)")
-    col1, col2 = st.columns([1, 1], gap="large")
-
-    with col1:
-        if audit_button("Geocode all stops missing lat/lng (cached)"):
-            updated = []
-            for s in st.session_state.stops:
-                if s.get("lat") is not None and s.get("lng") is not None:
-                    updated.append(s)
-                    continue
-                addr = (s.get("address") or "").strip()
-                if not addr:
-                    updated.append(s)
-                    continue
-                status, data = cached_forward_geocode(st.session_state.api_key, addr, st.session_state.country_filter, lang)
-                st.session_state.last_geocode_json = data
-                items = data.get("items") or data.get("results") or []
-                if items:
-                    pos = items[0].get("position") or {}
-                    s["lat"] = pos.get("lat")
-                    s["lng"] = pos.get("lng")
-                    if not s.get("address"):
-                        s["address"] = items[0].get("title") or (items[0].get("address", {}) or {}).get("label") or ""
-                    s["source"] = (s.get("source") or "") + "+geocoded"
-                updated.append(s)
-
-            st.session_state.stops = updated
-            st.session_state.map_version += 1
-            st.success("Geocoding done.")
-
-        if st.session_state.last_geocode_json:
-            st.download_button(
-                "Download last Geocode JSON",
-                data=json.dumps(st.session_state.last_geocode_json, indent=2, default=str),
-                file_name="geocode_last.json",
-                mime="application/json",
-            )
-
-    with col2:
-        st.write(f"Country filter: **{st.session_state.country_filter}**")
-        st.write(f"Center: **{st.session_state.center[0]:.6f}, {st.session_state.center[1]:.6f}**")
-
-    st.markdown("### Map (pins persist)")
-    center = infer_center(st.session_state.stops, st.session_state.center)
-    m = build_map(center, st.session_state.stops, zoom=11, show_arrows=False)
-    st_folium(m, height=560, use_container_width=True, key=f"geocode_map_v{st.session_state.map_version}")
-
-
-# =========================
-# TAB 2 — PLACES (POI SEARCH)
-# =========================
-with tabs[2]:
-    st.subheader("3) Places — Search POIs and add as stops")
-    st.caption("Uses /discover. Runs only when you click Search Places. Results persist until next search.")
-
-    st.write(f"Search center: **{st.session_state.center[0]:.6f}, {st.session_state.center[1]:.6f}** | Country filter: **{st.session_state.country_filter}**")
-
-    with st.form("places_form", clear_on_submit=False):
-        q = st.text_input("POI keyword (required for Places)", value="petrol pump")
-        radius = st.slider("Radius (meters)", min_value=500, max_value=50000, value=15000, step=500)
-        limit = st.slider("Limit", min_value=5, max_value=100, value=30, step=5)
-        use_country = st.checkbox("Apply country filter", value=True)
-        do_search = st.form_submit_button("Search Places")
-
-    if do_search:
-        if not q.strip():
-            st.warning("Places needs a keyword. For random stops without keyword, use Stop Manager → Generate random stops.")
-        else:
-            status, data = cached_places_discover(
-                st.session_state.api_key,
-                at=latlng_str(*st.session_state.center),
-                q=q.strip(),
-                radius=int(radius),
-                limit=int(limit),
-                country_filter=st.session_state.country_filter if use_country else None,
-                lang=lang,
-            )
-            st.session_state.last_places_json = data
-            st.info(f"Places response: HTTP {status}")
-
-            items = data.get("items") or data.get("results") or data.get("data") or []
-            results = []
-            for it in items:
-                pos = it.get("position") or it.get("location") or {}
-                title = it.get("title") or (it.get("address", {}) or {}).get("label") or it.get("name") or "POI"
-                addr_label = (it.get("address", {}) or {}).get("label") or title
-                results.append({
-                    "title": title,
-                    "lat": pos.get("lat"),
-                    "lng": pos.get("lng"),
-                    "address": addr_label,
-                    "raw": it,
-                })
-
-            st.session_state.places_results = results
-
-    results = st.session_state.places_results or []
-
-    colL, colR = st.columns([1, 1], gap="large")
-
-    with colL:
-        if st.session_state.last_places_json:
-            st.download_button(
-                "Download last Places JSON",
-                data=json.dumps(st.session_state.last_places_json, indent=2, default=str),
-                file_name="places_last.json",
-                mime="application/json",
-            )
-
-        if results:
-            st.markdown("### Select POIs to add as stops")
-            add_idx = st.multiselect(
-                "Pick results",
-                options=list(range(len(results))),
-                format_func=lambda i: results[i]["title"],
-                key="places_pick_multi",
-            )
-            if audit_button("Add selected POIs to stops"):
-                for i in add_idx:
-                    r = results[i]
-                    if r.get("lat") is None or r.get("lng") is None:
-                        continue
-                    st.session_state.stops.append({
-                        "label": r["title"],
-                        "address": r["address"],
-                        "lat": r["lat"],
-                        "lng": r["lng"],
-                        "source": "places_discover",
-                    })
-                st.session_state.map_version += 1
-                st.success(f"Added {len(add_idx)} stops. Total stops: {len(st.session_state.stops)}")
-
-            dfp = pd.DataFrame([{"title": r["title"], "lat": r["lat"], "lng": r["lng"]} for r in results])
-            st.dataframe(dfp, width="stretch")
-        else:
-            st.warning("No items found. If your raw JSON has items but UI shows none, it’s usually schema variance—download JSON and share a sample item.")
-
-    with colR:
-        st.markdown("### Places map (pins persist)")
-        preview_stops = [
-            {"label": r["title"], "address": r["address"], "lat": r["lat"], "lng": r["lng"]}
-            for r in results if r.get("lat") is not None and r.get("lng") is not None
-        ]
-        m = build_map(st.session_state.center, preview_stops, zoom=12, show_arrows=False)
-        st_folium(m, height=560, use_container_width=True, key=f"places_map_v{st.session_state.map_version}")
-
-
-# =========================
-# TAB 3 — ROUTE + OPTIMIZE (BEFORE VS AFTER)
-# =========================
 with tabs[3]:
-    st.subheader("4) Route + Optimize (Before vs After)")
-    st.caption("Step 1 draws the route line. Step 2 (ONE button) optimizes + polls result + recomputes route after.")
+    st.subheader("Results & Comparison")
 
-    stops = [s for s in st.session_state.stops if s.get("lat") is not None and s.get("lng") is not None]
+    stops = st.session_state.stops_df.copy()
+    depots = st.session_state.depots_df.copy()
+
     if len(stops) < 2:
-        st.warning("Need at least 2 stops with lat/lng. Use Stop Manager (generate) or Geocode tab.")
+        st.warning("Need at least 2 stops.")
     else:
-        n_use = st.slider("Stops used in route/opt", min_value=2, max_value=min(60, len(stops)), value=min(10, len(stops)))
-        stops_use = stops[:n_use]
+        # Baseline
+        if st.button("Run baseline Directions (fair compare)", width="stretch"):
+            audit("button_clicked", widget="baseline_directions")
+            try:
+                base_coords = build_baseline_order(stops, depots, return_to_start=return_to_start, depot_mode=depot_mode)
+                d0 = nb_directions(base_coords, mode=directions_mode, option=directions_option, avoid=avoid.strip())
+                st.session_state.directions_before = d0
+                st.success("Baseline directions computed.")
+            except Exception as e:
+                audit("error", where="baseline_directions", msg=str(e), level="ERROR")
+                st.error(str(e))
 
-        # ---- STEP 1 (BEFORE)
-        st.markdown("### Step 1 — Compute route (BEFORE)")
-        if audit_button("Compute Route (Before)"):
-            origin = latlng_str(stops_use[0]["lat"], stops_use[0]["lng"])
-            destination = latlng_str(stops_use[-1]["lat"], stops_use[-1]["lng"])
-            wps = "|".join(latlng_str(s["lat"], s["lng"]) for s in stops_use[1:-1]) if len(stops_use) > 2 else ""
+        # Optimized routes -> directions
+        st.write("Compute directions for optimized routes. For performance, you can limit how many driver routes to fetch.")
+        max_routes = st.number_input("Max driver routes to fetch directions for", min_value=1, max_value=25, value=5, step=1)
 
-            status, data = cached_directions(
-                st.session_state.api_key,
-                origin=origin,
-                destination=destination,
-                waypoints=wps,
-                mode=mode,
-                option=option,
-                avoid=avoid,
-                alternatives=alternatives,
-                departure_time=departure_unix,
-                route_type=route_type,
-                lang=lang,
-            )
-            st.session_state.last_directions_json_before = data
-            st.info(f"Directions (Before): HTTP {status}")
-
-            routes = data.get("routes") or []
-            dist_m = safe_get(routes, [0, "distance"], None)
-            dur_s = safe_get(routes, [0, "duration"], None)
-
-            coords = extract_route_coords(data)
-            st.session_state.before_route_coords = coords
-
-            st.session_state.before_metrics = {"distance_m": dist_m, "duration_s": dur_s}
-            st.session_state.map_version += 1
-
-        if st.session_state.before_metrics:
-            bm = st.session_state.before_metrics
-            st.write(f"**Before:** {fmt_meters(bm['distance_m'])} | ETA: {fmt_seconds(bm['duration_s'])}")
-            if not st.session_state.before_route_coords:
-                st.warning("No route geometry found in response → route line cannot draw. Download JSON and share if this repeats.")
-
-        # ---- STEP 2 (ONE BUTTON): optimize + poll + recompute after
-        st.markdown("---")
-        st.markdown("### Step 2 — Optimize + recompute route (AFTER) (ONE button)")
-        obj = st.selectbox("Optimization objective (travel_cost)", ["duration", "distance"], index=0)
-
-        if audit_button("Optimize + Recompute After Route"):
-            # Build VRP v2 request body per docs:
-            # - locations must be an object with `location` list => fixes "locations.location missing"
-            # - objective is object => options.objective.travel_cost
-            #   :contentReference[oaicite:3]{index=3}
-            locations_list = [latlng_str(s["lat"], s["lng"]) for s in stops_use]
-
-            jobs = [{"id": f"job_{i}", "location_index": i} for i in range(1, len(locations_list))]
-
-            body = {
-                "locations": {"id": 1, "location": locations_list},
-                "jobs": jobs,
-                "vehicles": [{"id": "vehicle_1", "start_index": 0, "end_index": 0}],
-                "options": {"objective": {"travel_cost": obj}},
-            }
-
-            status, data = cached_vrp_create(st.session_state.api_key, body)
-            st.session_state.last_opt_create_json = data
-            st.info(f"VRP create: HTTP {status}")
-
-            job_id = safe_get(data, ["data", "id"], None) or data.get("id") or safe_get(data, ["result", "id"], None)
-            st.session_state.vrp_job_id = job_id
-
-            if not job_id:
-                st.error("Optimization job id not found. Check JSON below.")
-                st.json(data)
-            else:
-                st.success(f"Optimization job created: {job_id}. Polling for result...")
-
-                # Poll until result is ready
-                result_data = None
-                max_wait_s = 60
-                step_s = 2
-                start = time.time()
-
-                with st.status("Waiting for optimization result...", expanded=False) as status_box:
-                    while time.time() - start < max_wait_s:
-                        rs, rd = vrp_result_no_cache(st.session_state.api_key, job_id)
-                        st.session_state.last_opt_result_json = rd
-
-                        # "ready" heuristics: routes exist
-                        routes = safe_get(rd, ["result", "routes"], None) or rd.get("routes")
-                        if routes:
-                            result_data = rd
-                            status_box.update(label="Optimization result received.", state="complete")
-                            break
-
-                        time.sleep(step_s)
-
-                    if result_data is None:
-                        status_box.update(label="Optimization result not ready yet.", state="error")
-
-                if result_data is None:
-                    st.error("Optimization result not ready or empty. Click the button again after a few seconds.")
+        if st.button("Run Directions for optimized solution", width="stretch"):
+            audit("button_clicked", widget="optimized_directions")
+            try:
+                opt = st.session_state.get("last_opt_result_json")
+                if not opt:
+                    st.error("Fetch optimization result first (Optimize tab).")
                 else:
-                    # Extract order from VRP result
-                    order = [0]
-                    routes = safe_get(result_data, ["result", "routes"], []) or result_data.get("routes") or []
-                    if routes:
-                        steps = routes[0].get("steps") or []
-                        for step in steps:
-                            li = step.get("location_index") or step.get("locationIndex")
-                            if li is not None and int(li) != 0:
-                                order.append(int(li))
-                    if order[-1] != 0:
-                        order.append(0)
-
-                    # fallback
-                    if len(order) <= 2:
-                        order = list(range(len(locations_list)))
-
-                    # build after sequence (skip duplicate depot)
-                    seq = []
-                    for idx in order:
-                        if seq and idx == seq[-1]:
-                            continue
-                        seq.append(idx)
-
-                    seq_coords = [locations_list[i] for i in seq if i < len(locations_list)]
-                    if len(seq_coords) >= 2:
-                        origin2 = seq_coords[0]
-                        dest2 = seq_coords[-1]
-                        wps2 = "|".join(seq_coords[1:-1]) if len(seq_coords) > 2 else ""
-
-                        s2, d2 = cached_directions(
-                            st.session_state.api_key,
-                            origin=origin2,
-                            destination=dest2,
-                            waypoints=wps2,
-                            mode=mode,
-                            option=option,
-                            avoid=avoid,
-                            alternatives=alternatives,
-                            departure_time=departure_unix,
-                            route_type=route_type,
-                            lang=lang,
-                        )
-                        st.session_state.last_directions_json_after = d2
-                        st.info(f"Directions (After): HTTP {s2}")
-
-                        routes2 = d2.get("routes") or []
-                        dist2 = safe_get(routes2, [0, "distance"], None)
-                        dur2 = safe_get(routes2, [0, "duration"], None)
-                        coords2 = extract_route_coords(d2)
-
-                        st.session_state.after_metrics = {"distance_m": dist2, "duration_s": dur2}
-                        st.session_state.after_route_coords = coords2
-
-                        # Save the optimized stop order for mapping with correct numbering
-                        # Create a re-ordered stop list (without final depot repeat)
-                        order_wo_last_depot = [i for i in seq if i != 0]
-                        # If depot included only once, this works. Otherwise fallback.
-                        if order_wo_last_depot:
-                            reordered = [stops_use[0]] + [stops_use[i] for i in order_wo_last_depot if i < len(stops_use)]
-                            # De-dup in case of oddities
-                            seen = set()
-                            cleaned = []
-                            for s in reordered:
-                                key = (s.get("lat"), s.get("lng"))
-                                if key not in seen:
-                                    seen.add(key)
-                                    cleaned.append(s)
-                            st.session_state.optimized_stops_use = cleaned
+                    routes = parse_vrp_routes(opt)
+                    if not routes:
+                        st.error("No routes found in optimization result.")
+                    else:
+                        # Build map from location indices to coordinates
+                        # Rebuild locations mapping from latest payload
+                        payload = st.session_state.get("last_opt_create_payload")
+                        if not payload:
+                            st.error("Missing last optimization payload. Re-run optimization create.")
                         else:
-                            st.session_state.optimized_stops_use = stops_use
+                            loc_arr = payload.get("locations", {}).get("location", [])
+                            # loc_arr is [[lng,lat], ...]
+                            locs = [(float(latlng[1]), float(latlng[0])) for latlng in loc_arr]
 
-                        st.session_state.map_version += 1
+                            dirs_by_vehicle = {}
+                            for r in routes[: int(max_routes)]:
+                                vehicle_id = r.get("vehicle")
+                                idxs = route_steps_to_location_indices(r)
+                                if len(idxs) < 2:
+                                    continue
+                                coords = [locs[i] for i in idxs]
+                                d = nb_directions(coords, mode=directions_mode, option=directions_option, avoid=avoid.strip())
+                                dirs_by_vehicle[str(vehicle_id)] = {"indices": idxs, "directions": d}
+                            st.session_state.directions_after_by_vehicle = dirs_by_vehicle
+                            st.success(f"Computed directions for {len(dirs_by_vehicle)} route(s).")
+            except Exception as e:
+                audit("error", where="optimized_directions", msg=str(e), level="ERROR")
+                st.error(str(e))
 
-        # ---- COMPARISON
-        if st.session_state.before_metrics and st.session_state.after_metrics:
-            bm = st.session_state.before_metrics
-            am = st.session_state.after_metrics
+        # Show metrics + maps
+        colL, colR = st.columns(2)
 
-            dist_saved = None
-            dur_saved = None
-            pct_dist = None
-            pct_dur = None
+        with colL:
+            st.markdown("### Baseline (Before)")
+            d0 = st.session_state.get("directions_before")
+            if d0:
+                dist_m, dur_s = compute_directions_metrics(d0)
+                st.metric("Distance", f"{dist_m/1000:.2f} km")
+                st.metric("Duration", f"{dur_s/60:.1f} min")
+                geom = (d0.get("routes") or [{}])[0].get("geometry", "")
+                # coords used for baseline map
+                base_coords = build_baseline_order(stops, depots, return_to_start=return_to_start, depot_mode=depot_mode)
+                m = folium_map_for_route(base_coords, geometry=geom, labels=["B"] * len(base_coords))
+                st_folium(m, height=420, width="100%")
+                st.download_button("Download baseline directions JSON", data=json.dumps(d0, ensure_ascii=False), file_name="directions_before.json", mime="application/json", width="content")
+            else:
+                st.info("Run baseline directions first.")
 
-            if bm["distance_m"] is not None and am["distance_m"] is not None and bm["distance_m"]:
-                dist_saved = bm["distance_m"] - am["distance_m"]
-                pct_dist = dist_saved / bm["distance_m"] * 100
+        with colR:
+            st.markdown("### Optimized (After)")
+            dirs = st.session_state.get("directions_after_by_vehicle", {})
+            if dirs:
+                # Aggregate metrics across fetched routes
+                total_d_m = 0.0
+                total_t_s = 0.0
+                rows = []
+                for vid, pack in dirs.items():
+                    d = pack["directions"]
+                    dm, ts = compute_directions_metrics(d)
+                    total_d_m += dm
+                    total_t_s += ts
+                    rows.append({"vehicle": vid, "distance_km": dm/1000, "duration_min": ts/60})
+                st.metric("Total distance (fetched routes)", f"{total_d_m/1000:.2f} km")
+                st.metric("Total duration (fetched routes)", f"{total_t_s/60:.1f} min")
+                st.dataframe(pd.DataFrame(rows).sort_values("vehicle"), width="stretch")
 
-            if bm["duration_s"] is not None and am["duration_s"] is not None and bm["duration_s"]:
-                dur_saved = bm["duration_s"] - am["duration_s"]
-                pct_dur = dur_saved / bm["duration_s"] * 100
+                # Show one route map (select)
+                sel = st.selectbox("View route for vehicle", options=[r["vehicle"] for r in rows], index=0)
+                chosen = dirs[str(sel)]
+                idxs = chosen["indices"]
+                payload = st.session_state.get("last_opt_create_payload")
+                loc_arr = payload.get("locations", {}).get("location", [])
+                locs = [(float(latlng[1]), float(latlng[0])) for latlng in loc_arr]
+                coords = [locs[i] for i in idxs]
+                geom = (chosen["directions"].get("routes") or [{}])[0].get("geometry", "")
+                m = folium_map_for_route(coords, geometry=geom, labels=[str(i) for i in idxs])
+                st_folium(m, height=420, width="100%")
 
-            st.markdown("## Results")
-            st.write(f"**Results (Before):** Distance: {fmt_meters(bm['distance_m'])} | ETA: {fmt_seconds(bm['duration_s'])}")
-            st.write(f"**Results (After Optimization):** Distance: {fmt_meters(am['distance_m'])} | ETA: {fmt_seconds(am['duration_s'])}")
-
-            if dist_saved is not None and pct_dist is not None:
-                st.success(f"Distance saved: {fmt_meters(dist_saved)} ({pct_dist:.1f}%)")
-            if dur_saved is not None and pct_dur is not None:
-                st.success(f"Time saved: {fmt_seconds(dur_saved)} ({pct_dur:.1f}%)")
-
-        # ---- TWO MAPS SIDE BY SIDE (BEFORE + AFTER) + ARROWS
-        st.markdown("### Maps (Before vs After) — numbered stops + direction arrows")
-
-        left, right = st.columns(2, gap="large")
-
-        with left:
-            st.markdown("#### Map — Before")
-            center_b = infer_center(stops_use, st.session_state.center)
-            m1 = build_map(
-                center=center_b,
-                stops=stops_use,
-                route_coords=st.session_state.before_route_coords,
-                zoom=11,
-                show_arrows=True,
-            )
-            st_folium(m1, height=520, use_container_width=True, key=f"map_before_v{st.session_state.map_version}")
-
-        with right:
-            st.markdown("#### Map — After Optimization")
-            after_stops = st.session_state.get("optimized_stops_use") or stops_use
-            center_a = infer_center(after_stops, st.session_state.center)
-            m2 = build_map(
-                center=center_a,
-                stops=after_stops,
-                route_coords=st.session_state.after_route_coords,
-                zoom=11,
-                show_arrows=True,
-            )
-            st_folium(m2, height=520, use_container_width=True, key=f"map_after_v{st.session_state.map_version}")
-
-        # downloads
-        colD1, colD2, colD3, colD4 = st.columns(4)
-        with colD1:
-            if st.session_state.last_directions_json_before:
                 st.download_button(
-                    "Download Directions (Before)",
-                    data=json.dumps(st.session_state.last_directions_json_before, indent=2, default=str),
-                    file_name="directions_before.json",
+                    "Download optimized directions bundle (JSON)",
+                    data=json.dumps(dirs, ensure_ascii=False),
+                    file_name="directions_after_by_vehicle.json",
                     mime="application/json",
+                    width="content",
                 )
-        with colD2:
-            if st.session_state.last_directions_json_after:
-                st.download_button(
-                    "Download Directions (After)",
-                    data=json.dumps(st.session_state.last_directions_json_after, indent=2, default=str),
-                    file_name="directions_after.json",
-                    mime="application/json",
-                )
-        with colD3:
-            if st.session_state.last_opt_create_json:
-                st.download_button(
-                    "Download VRP Create JSON",
-                    data=json.dumps(st.session_state.last_opt_create_json, indent=2, default=str),
-                    file_name="opt_create_last.json",
-                    mime="application/json",
-                )
-        with colD4:
-            if st.session_state.last_opt_result_json:
-                st.download_button(
-                    "Download VRP Result JSON",
-                    data=json.dumps(st.session_state.last_opt_result_json, indent=2, default=str),
-                    file_name="opt_result_last.json",
-                    mime="application/json",
-                )
+            else:
+                st.info("Run 'Directions for optimized solution' to populate per-vehicle routes.")
 
-
-# =========================
-# TAB 4 — DISTANCE MATRIX (NxN)
-# =========================
+# -------------------------
+# Clustering tab (raw runner)
+# -------------------------
 with tabs[4]:
-    st.subheader("5) Distance Matrix (NxN for 20+ points)")
-    st.caption("Many-to-many: origins and destinations are 'lat,lng|lat,lng|...'")
+    st.subheader("Clustering API (raw)")
+    st.write(
+        "This tab lets you run Clustering API without guessing request schema. "
+        "Paste your JSON request body, submit, then fetch result by ID. "
+        "Endpoints: POST /clustering and GET /clustering/result per docs. citeturn1view0"
+    )
+    example = {
+        "description": "My clustering test",
+        "routing": {"mode": "car", "option": "fast"},
+        "jobs": [
+            {"id": 1, "location": [75.7873, 26.9124]},
+            {"id": 2, "location": [75.7644, 26.8531]},
+        ],
+        "clustering": {"max_cluster_radius": 5000},
+    }
+    body_text = st.text_area("Clustering request body (JSON)", value=json.dumps(example, indent=2), height=220)
 
-    stops = [s for s in st.session_state.stops if s.get("lat") is not None and s.get("lng") is not None]
-    if len(stops) < 2:
-        st.warning("Need at least 2 geocoded stops.")
-    else:
-        n_use = st.slider("Stops used in NxN", min_value=2, max_value=min(50, len(stops)), value=min(20, len(stops)))
-        use_stops = stops[:n_use]
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Create clustering job", width="stretch"):
+            audit("button_clicked", widget="cluster_create")
+            try:
+                payload = json.loads(body_text)
+                st.session_state.last_cluster_payload = payload
+                res = nb_cluster_create(payload)
+                st.session_state.last_cluster_create_json = res
+                st.session_state.last_cluster_task_id = res.get("id")
+                st.success(f"Clustering job created: {st.session_state.last_cluster_task_id}")
+                st.json(res)
+            except Exception as e:
+                audit("error", where="cluster_create", msg=str(e), level="ERROR")
+                st.error(str(e))
 
-        origins = "|".join(latlng_str(s["lat"], s["lng"]) for s in use_stops)
-        destinations = origins
+    with colB:
+        if st.button("Fetch clustering result", width="stretch"):
+            audit("button_clicked", widget="cluster_result")
+            try:
+                cid = st.session_state.get("last_cluster_task_id")
+                if not cid:
+                    st.error("No clustering job id yet.")
+                else:
+                    res = nb_cluster_result(cid)
+                    st.session_state.last_cluster_result_json = res
+                    st.json(res)
+            except Exception as e:
+                audit("error", where="cluster_result", msg=str(e), level="ERROR")
+                st.error(str(e))
 
-        if audit_button("Compute Distance Matrix (NxN)"):
-            status, data = cached_distance_matrix(
-                st.session_state.api_key,
-                origins=origins,
-                destinations=destinations,
-                mode=mode,
-                option=option,
-                avoid=avoid,
-                departure_time=departure_unix,
-                route_type=route_type,
-                lang=lang,
-            )
-            st.session_state.last_matrix_json = data
-            st.info(f"Distance Matrix: HTTP {status}")
-
-        if st.session_state.last_matrix_json:
-            dm = st.session_state.last_matrix_json
-            st.download_button(
-                "Download Distance Matrix JSON",
-                data=json.dumps(dm, indent=2, default=str),
-                file_name="distance_matrix_last.json",
-                mime="application/json",
-            )
-
-            rows = dm.get("rows") or []
-            matrix_dist = []
-            matrix_dur = []
-            for r in rows:
-                elems = r.get("elements") if isinstance(r, dict) else None
-                dist_row = []
-                dur_row = []
-                for e in (elems or []):
-                    dist_row.append(safe_get(e, ["distance", "value"], None))
-                    dur_row.append(safe_get(e, ["duration", "value"], None))
-                if dist_row:
-                    matrix_dist.append(dist_row)
-                    matrix_dur.append(dur_row)
-
-            if matrix_dist:
-                st.markdown("### Distance (km)")
-                df_dist = pd.DataFrame(matrix_dist) / 1000.0
-                st.dataframe(df_dist.style.format("{:.2f}"), width="stretch")
-
-            if matrix_dur:
-                st.markdown("### Duration (minutes)")
-                df_dur = pd.DataFrame(matrix_dur) / 60.0
-                st.dataframe(df_dur.style.format("{:.1f}"), width="stretch")
-
-
-# =========================
-# TAB 5 — SNAP TO ROADS + ISOCHRONE
-# =========================
-with tabs[5]:
-    st.subheader("6) Snap-to-Roads + Isochrone (edge-case testing)")
-    st.caption("Snap-to-Roads: snaps your path to road network. Isochrone: reachable area within X minutes.")
-
-    st.markdown("### A) Snap-to-Roads")
-    stops = [s for s in st.session_state.stops if s.get("lat") is not None and s.get("lng") is not None]
-    if len(stops) < 2:
-        st.warning("Need at least 2 geocoded stops.")
-    else:
-        n_use = st.slider("Points for snap path", min_value=2, max_value=min(100, len(stops)), value=min(20, len(stops)))
-        pts = stops[:n_use]
-        path_str = "|".join(latlng_str(p["lat"], p["lng"]) for p in pts)
-
-        col1, col2 = st.columns([1, 1], gap="large")
-        with col1:
-            geometry = st.selectbox("Snap geometry", ["", "geojson"], index=1)
-            use_radiuses = st.checkbox("Add radiuses", value=False)
-            use_timestamps = st.checkbox("Add timestamps", value=False)
-
-        radiuses = "|".join(["30"] * len(pts)) if use_radiuses else None
-        timestamps = None
-        if use_timestamps:
-            t0 = now_unix() - 600
-            timestamps = "|".join(str(t0 + i * 60) for i in range(len(pts)))
-
-        if audit_button("Snap To Roads"):
-            status, data = cached_snap_to_roads(
-                st.session_state.api_key,
-                path_str=path_str,
-                radiuses=radiuses,
-                timestamps=timestamps,
-                mode=mode if mode in ["car", "truck"] else "car",
-                geometry=geometry,
-            )
-            st.info(f"SnapToRoads: HTTP {status}")
-            st.session_state.last_snap_json = data
-            st.session_state.map_version += 1
-
-        if st.session_state.last_snap_json:
-            data = st.session_state.last_snap_json
-            st.download_button(
-                "Download SnapToRoads JSON",
-                data=json.dumps(data, indent=2, default=str),
-                file_name="snap_to_roads_last.json",
-                mime="application/json",
-            )
-
-            # draw snapped geometry if present
-            geom = data.get("geometry")
-            coords = []
-            if geometry == "geojson" and isinstance(geom, dict):
-                try:
-                    if geom.get("type") == "LineString":
-                        coords = [(c[1], c[0]) for c in geom.get("coordinates", [])]
-                except Exception:
-                    coords = []
-            elif isinstance(geom, str):
-                coords = decode_polyline(geom, precision=5)
-
-            center = infer_center(pts, st.session_state.center)
-            m = build_map(center, pts, route_coords=coords, zoom=12, show_arrows=True)
-            st_folium(m, height=520, use_container_width=True, key=f"snap_map_v{st.session_state.map_version}")
-
-    st.markdown("---")
-    st.markdown("### B) Isochrone")
-    cA, cB = st.columns([1, 1], gap="large")
-    with cA:
-        coords_in = st.text_input("Coordinates (lat,lng)", value=latlng_str(*st.session_state.center))
-        contours = st.text_input("contours_minutes (comma-separated)", value="5,10,15")
-    with cB:
-        iso_mode = st.selectbox("Isochrone mode", ["car", "truck"], index=0)
-
-    if audit_button("Compute Isochrone"):
-        status, data = cached_isochrone(
-            st.session_state.api_key,
-            coordinates=coords_in,
-            mode=iso_mode,
-            contours_minutes=contours,
-            departure_time=departure_unix,
-        )
-        st.info(f"Isochrone: HTTP {status}")
-        st.session_state.last_iso_json = data
-        st.session_state.map_version += 1
-
-    if st.session_state.last_iso_json:
-        data = st.session_state.last_iso_json
+    if st.session_state.get("last_cluster_result_json"):
         st.download_button(
-            "Download Isochrone JSON",
-            data=json.dumps(data, indent=2, default=str),
-            file_name="isochrone_last.json",
+            "Download last Clustering Result JSON",
+            data=json.dumps(st.session_state.last_cluster_result_json, ensure_ascii=False),
+            file_name="clustering_result_last.json",
             mime="application/json",
+            width="content",
         )
 
-        features = data.get("features") or []
-        center_ll = parse_latlng(coords_in) or st.session_state.center
-        m = folium.Map(location=[center_ll[0], center_ll[1]], zoom_start=12, control_scale=True)
-        folium.Marker([center_ll[0], center_ll[1]], tooltip="Center", icon=folium.Icon(color="blue")).add_to(m)
-
-        try:
-            for f in features:
-                gj = {"type": "Feature", "geometry": f.get("geometry"), "properties": f.get("properties", {})}
-                folium.GeoJson(gj).add_to(m)
-        except Exception:
-            pass
-
-        st_folium(m, height=520, use_container_width=True, key=f"iso_map_v{st.session_state.map_version}")
+# -------------------------
+# Logs tab
+# -------------------------
+with tabs[5]:
+    st.subheader("Session logs")
+    st.caption("These are session-scoped logs. Backend logs are also visible in Streamlit Community Cloud → Manage app → Cloud logs.")
+    last_n = st.number_input("Show last N events", min_value=10, max_value=600, value=80, step=10)
+    events = st.session_state.get("audit_events", [])[-int(last_n):]
+    st.code("\n".join(json.dumps(e, ensure_ascii=False) for e in events), language="json")
+    st.download_button(
+        "Download session logs (JSONL)",
+        data="\n".join(json.dumps(e, ensure_ascii=False) for e in st.session_state.get("audit_events", [])),
+        file_name=f"audit_{st.session_state.get('run_id','')}.jsonl",
+        mime="application/json",
+        width="content",
+    )
