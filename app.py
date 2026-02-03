@@ -16,7 +16,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -47,7 +47,7 @@ st.set_page_config(page_title="NextBillion Routing Testbench", layout="wide")
 # =========================
 
 def now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace('+00:00','Z')
 
 def safe_json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
@@ -92,7 +92,7 @@ def seconds_to_hhmm(sec: Optional[int]) -> str:
 def init_state():
     ss = st.session_state
     if "run_id" not in ss:
-        ss.run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        ss.run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     if "seed" not in ss:
         ss.seed = 42
     if "stops_df" not in ss:
