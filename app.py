@@ -6,6 +6,8 @@ import random
 import time
 import json
 import os
+import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -26,6 +28,193 @@ NB_BASE = "https://api.nextbillion.io"
 UA = {"User-Agent": "NextBillion-Visual-Tester/1.0"}
 
 st.set_page_config(page_title="NextBillion.ai — Visual API Tester", layout="wide")
+
+# =========================
+# AUDIT / DEBUG LOGGING
+# =========================
+
+# We log to:
+# 1) Console (visible in Streamlit Community Cloud → Manage app → Cloud logs)
+# 2) In-app sidebar panel (session-only)
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _mask_secret(s: str, keep_last: int = 4) -> str:
+    s = "" if s is None else str(s)
+    if not s:
+        return s
+    if len(s) <= keep_last:
+        return "*" * len(s)
+    return "*" * (len(s) - keep_last) + s[-keep_last:]
+
+
+def _safe_preview(v, max_len: int = 180):
+    """Small printable preview for logs; avoids dumping huge objects."""
+    try:
+        if isinstance(v, (int, float, bool)) or v is None:
+            return v
+        if isinstance(v, str):
+            return v if len(v) <= max_len else (v[:max_len] + "…")
+        if isinstance(v, (list, tuple)):
+            return {"type": type(v).__name__, "len": len(v)}
+        if isinstance(v, dict):
+            return {"type": "dict", "keys": list(v.keys())[:20], "len": len(v)}
+        return {"type": type(v).__name__}
+    except Exception:
+        return str(v)[:max_len]
+
+
+def init_audit_logger():
+    if "audit_events" not in st.session_state:
+        st.session_state.audit_events = []
+    if "run_id" not in st.session_state:
+        st.session_state.run_id = str(uuid.uuid4())[:8]
+    # Performance-friendly defaults (can be toggled in sidebar)
+    st.session_state.setdefault("audit_enabled", os.getenv("AUDIT_ENABLED", "0") == "1")
+    st.session_state.setdefault("audit_console", os.getenv("AUDIT_CONSOLE", "0") == "1")  # write ALL events to Cloud logs
+    st.session_state.setdefault("audit_state_diff", False)  # diff session_state on reruns (expensive)
+    st.session_state.setdefault("audit_sample_rate", 1)  # log 1 of N non-critical events
+    st.session_state.setdefault("audit_max_events", 600)  # in-app buffer size
+
+    logger = logging.getLogger("nextbillion_audit")
+    if not logger.handlers:
+        h = logging.StreamHandler()
+        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+        h.setFormatter(fmt)
+        logger.addHandler(h)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    return logger
+
+
+AUDIT_LOG = init_audit_logger()
+
+
+def _should_log_event(event: str) -> bool:
+    # Always keep API and error signals
+    if event.startswith("api_") or event in {"button_clicked", "error"}:
+        return True
+    return bool(st.session_state.get("audit_enabled", False))
+
+
+def audit_event(event: str, **fields):
+    # Sampling for noisy events when audit is enabled
+    if not _should_log_event(event):
+        return
+
+    sample_n = int(st.session_state.get("audit_sample_rate", 1) or 1)
+    if sample_n > 1 and event not in {"button_clicked"} and not event.startswith("api_"):
+        # Cheap sampler: keep 1 of N
+        if (hash(event) ^ len(st.session_state.get("audit_events", []))) % sample_n != 0:
+            return
+
+    payload = {
+        "ts": _utc_now_iso(),
+        "run_id": st.session_state.get("run_id", ""),
+        "event": event,
+    }
+    for k, v in fields.items():
+        payload[k] = _safe_preview(v)
+
+    # Console logs (Community Cloud "Cloud logs") can be I/O heavy:
+    # default is only API + errors; can be turned on for all events via audit_console.
+    if event.startswith("api_") or event in {"error"} or bool(st.session_state.get("audit_console", False)):
+        AUDIT_LOG.info(json.dumps(payload, ensure_ascii=False))
+
+    # In-app session log (bounded)
+    st.session_state.audit_events.append(payload)
+    max_ev = int(st.session_state.get("audit_max_events", 600) or 600)
+    if len(st.session_state.audit_events) > max_ev:
+        st.session_state.audit_events = st.session_state.audit_events[-max_ev:]
+
+
+def audit_session_state_changes():
+    """Optional (expensive): diff session_state between runs for debugging."""
+    if not (st.session_state.get("audit_enabled", False) and st.session_state.get("audit_state_diff", False)):
+        # Keep snapshot minimal so enabling diff later works
+        if "audit_prev_snapshot" not in st.session_state:
+            st.session_state.audit_prev_snapshot = {}
+        return
+
+    deny = {
+        "audit_events", "run_id", "audit_prev_snapshot",
+        "audit_enabled", "audit_console", "audit_state_diff", "audit_sample_rate", "audit_max_events",
+        # large payload buckets (avoid noisy diffs)
+        "last_geocode_json", "last_places_json", "last_directions_json", "last_optimize_json",
+        "region_results", "places_results",
+    }
+
+    prev = st.session_state.get("audit_prev_snapshot") or {}
+    # Only consider keys that are likely widgets / small values
+    cur = {}
+    for k in st.session_state.keys():
+        if k in deny:
+            continue
+        v = st.session_state.get(k)
+        # Skip large objects early
+        if isinstance(v, (dict, list, tuple)) and len(v) > 60:
+            continue
+        cur[k] = _safe_preview(v)
+
+    changed = []
+    for k, v in cur.items():
+        if prev.get(k) != v:
+            changed.append((k, prev.get(k), v))
+
+    for k, old, new in changed[:25]:
+        audit_event("state_change", key=k, old=old, new=new)
+
+    st.session_state.audit_prev_snapshot = cur
+
+
+# IMPORTANT: prevent recursion by calling the original Streamlit button
+_ST_BUTTON = st.button
+
+def audit_button(label: str, *args, **kwargs) -> bool:
+    clicked = _ST_BUTTON(label, *args, **kwargs)
+    if clicked:
+        audit_event("button_clicked", label=label, key=kwargs.get("key"))
+    return clicked
+
+
+def render_audit_panel():
+    # Keep this panel lightweight: code inside expanders runs on every rerun,
+    # even when collapsed. (So avoid building huge strings unless requested.)
+    with st.sidebar.expander("🧪 Debug / Audit logs", expanded=False):
+        st.caption("Logs help debugging. Heavy logging can slow the app—toggle it on only when needed.")
+
+        st.checkbox("Enable debug logging", key="audit_enabled")
+        st.checkbox("Log ALL events to Cloud logs (noisy)", key="audit_console")
+        st.checkbox("Track widget/state diffs on reruns (expensive)", key="audit_state_diff")
+        st.number_input("Sample 1 of N non-critical events", min_value=1, max_value=50, value=int(st.session_state.get("audit_sample_rate", 1)), step=1, key="audit_sample_rate")
+        st.number_input("In-app log buffer size", min_value=100, max_value=2500, value=int(st.session_state.get("audit_max_events", 600)), step=100, key="audit_max_events")
+
+        if st.button("Show session logs (render)", key="audit_render_btn"):
+            st.session_state.audit_render = True
+
+        if st.session_state.get("audit_render", False):
+            show_n = st.number_input("Show last N events", min_value=10, max_value=500, value=80, step=10, key="audit_show_n")
+            ev = st.session_state.get("audit_events", [])[-int(show_n):]
+            # Simple table view (faster than rendering huge JSON strings)
+            if ev:
+                st.dataframe(pd.DataFrame(ev), width="stretch")
+            st.download_button(
+                "Download session logs (JSONL)",
+                data="\n".join(json.dumps(e, ensure_ascii=False) for e in st.session_state.get("audit_events", [])),
+                file_name=f"audit_{st.session_state.get('run_id','')}.jsonl",
+                mime="application/json",
+            )
+
+
+
+
+
+# Capture widget/state changes on each rerun (best-effort)
+audit_session_state_changes()
+
+
 
 
 # =========================
@@ -77,7 +266,24 @@ def safe_get(d: Dict, path: List, default=None):
 
 def nb_get(path: str, params: Dict, timeout: int = 60) -> Tuple[int, Dict]:
     url = f"{NB_BASE}{path}"
-    r = requests.get(url, params=params, headers=UA, timeout=timeout)
+
+    # mask API key in logs
+    p = dict(params or {})
+    if "key" in p:
+        p["key"] = _mask_secret(p.get("key"))
+
+    t0 = time.time()
+    audit_event("api_get_start", path=path, params=p, timeout=timeout)
+
+    try:
+        r = requests.get(url, params=params, headers=UA, timeout=timeout)
+    except Exception as e:
+        audit_event("api_get_error", path=path, params=p, error=str(e))
+        return 0, {"error": str(e)}
+
+    ms = int((time.time() - t0) * 1000)
+    audit_event("api_get_end", path=path, status=r.status_code, ms=ms, bytes=len(r.text) if r.text else 0)
+
     try:
         return r.status_code, r.json()
     except Exception:
@@ -86,12 +292,28 @@ def nb_get(path: str, params: Dict, timeout: int = 60) -> Tuple[int, Dict]:
 
 def nb_post(path: str, params: Dict, body: Dict, timeout: int = 60) -> Tuple[int, Dict]:
     url = f"{NB_BASE}{path}"
-    r = requests.post(url, params=params, json=body, headers=UA, timeout=timeout)
+
+    # mask API key in logs
+    p = dict(params or {})
+    if "key" in p:
+        p["key"] = _mask_secret(p.get("key"))
+
+    t0 = time.time()
+    audit_event("api_post_start", path=path, params=p, body=_safe_preview(body), timeout=timeout)
+
+    try:
+        r = requests.post(url, params=params, json=body, headers=UA, timeout=timeout)
+    except Exception as e:
+        audit_event("api_post_error", path=path, params=p, error=str(e))
+        return 0, {"error": str(e)}
+
+    ms = int((time.time() - t0) * 1000)
+    audit_event("api_post_end", path=path, status=r.status_code, ms=ms, bytes=len(r.text) if r.text else 0)
+
     try:
         return r.status_code, r.json()
     except Exception:
         return r.status_code, {"raw": r.text}
-
 
 def latlng_str(lat: float, lng: float) -> str:
     return f"{lat:.6f},{lng:.6f}"
@@ -406,6 +628,7 @@ def vrp_result_no_cache(api_key: str, job_id: str) -> Tuple[int, Dict]:
 # UI — SIDEBAR GLOBAL OPTIONS
 # =========================
 st.sidebar.title("Config")
+render_audit_panel()
 
 st.session_state.api_key = st.sidebar.text_input(
     "NextBillion API Key",
@@ -523,7 +746,7 @@ with tabs[0]:
                 format_func=lambda i: f"{st.session_state.region_results[i]['title']} ({st.session_state.region_results[i]['countryCode'] or '-'})",
                 key="region_pick_selectbox",
             )
-            if st.button("Use picked region as center"):
+            if audit_button("Use picked region as center"):
                 chosen = st.session_state.region_results[pick]
                 if chosen.get("lat") is not None and chosen.get("lng") is not None:
                     st.session_state.center = (chosen["lat"], chosen["lng"])
@@ -541,7 +764,7 @@ with tabs[0]:
 
         colA, colB = st.columns(2)
         with colA:
-            if st.button("Add / Replace Stops"):
+            if audit_button("Add / Replace Stops"):
                 lines = [x.strip() for x in pasted.splitlines() if x.strip()]
                 new_stops = []
                 for i, line in enumerate(lines):
@@ -555,7 +778,7 @@ with tabs[0]:
                 st.session_state.stops = new_stops
                 st.success(f"Loaded {len(st.session_state.stops)} stops")
         with colB:
-            if st.button("Clear Stops"):
+            if audit_button("Clear Stops"):
                 st.session_state.stops = []
                 st.success("Stops cleared")
 
@@ -586,7 +809,7 @@ with tabs[0]:
             st.session_state.map_click = (clicked["lat"], clicked["lng"])
             st.info(f"Clicked: {clicked['lat']:.6f}, {clicked['lng']:.6f}")
 
-        if st.button("Use clicked point as center"):
+        if audit_button("Use clicked point as center"):
             if st.session_state.map_click:
                 st.session_state.center = st.session_state.map_click
                 st.session_state.map_version += 1
@@ -649,7 +872,7 @@ with tabs[1]:
     col1, col2 = st.columns([1, 1], gap="large")
 
     with col1:
-        if st.button("Geocode all stops missing lat/lng (cached)"):
+        if audit_button("Geocode all stops missing lat/lng (cached)"):
             updated = []
             for s in st.session_state.stops:
                 if s.get("lat") is not None and s.get("lng") is not None:
@@ -762,7 +985,7 @@ with tabs[2]:
                 format_func=lambda i: results[i]["title"],
                 key="places_pick_multi",
             )
-            if st.button("Add selected POIs to stops"):
+            if audit_button("Add selected POIs to stops"):
                 for i in add_idx:
                     r = results[i]
                     if r.get("lat") is None or r.get("lng") is None:
@@ -808,7 +1031,7 @@ with tabs[3]:
 
         # ---- STEP 1 (BEFORE)
         st.markdown("### Step 1 — Compute route (BEFORE)")
-        if st.button("Compute Route (Before)"):
+        if audit_button("Compute Route (Before)"):
             origin = latlng_str(stops_use[0]["lat"], stops_use[0]["lng"])
             destination = latlng_str(stops_use[-1]["lat"], stops_use[-1]["lng"])
             wps = "|".join(latlng_str(s["lat"], s["lng"]) for s in stops_use[1:-1]) if len(stops_use) > 2 else ""
@@ -850,7 +1073,7 @@ with tabs[3]:
         st.markdown("### Step 2 — Optimize + recompute route (AFTER) (ONE button)")
         obj = st.selectbox("Optimization objective (travel_cost)", ["duration", "distance"], index=0)
 
-        if st.button("Optimize + Recompute After Route"):
+        if audit_button("Optimize + Recompute After Route"):
             # Build VRP v2 request body per docs:
             # - locations must be an object with `location` list => fixes "locations.location missing"
             # - objective is object => options.objective.travel_cost
@@ -1088,7 +1311,7 @@ with tabs[4]:
         origins = "|".join(latlng_str(s["lat"], s["lng"]) for s in use_stops)
         destinations = origins
 
-        if st.button("Compute Distance Matrix (NxN)"):
+        if audit_button("Compute Distance Matrix (NxN)"):
             status, data = cached_distance_matrix(
                 st.session_state.api_key,
                 origins=origins,
@@ -1165,7 +1388,7 @@ with tabs[5]:
             t0 = now_unix() - 600
             timestamps = "|".join(str(t0 + i * 60) for i in range(len(pts)))
 
-        if st.button("Snap To Roads"):
+        if audit_button("Snap To Roads"):
             status, data = cached_snap_to_roads(
                 st.session_state.api_key,
                 path_str=path_str,
@@ -1212,7 +1435,7 @@ with tabs[5]:
     with cB:
         iso_mode = st.selectbox("Isochrone mode", ["car", "truck"], index=0)
 
-    if st.button("Compute Isochrone"):
+    if audit_button("Compute Isochrone"):
         status, data = cached_isochrone(
             st.session_state.api_key,
             coordinates=coords_in,
