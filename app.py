@@ -1,856 +1,1340 @@
-# NextBillion.ai — Multi-Driver Routing Testbench (Streamlit)
-# Deploy on Streamlit Community Cloud. Set secret NEXTBILLION_API_KEY in Streamlit Secrets.
-#
-# Key features:
-# - Stops editor with optional time windows
-# - Driver/vehicle generator (default 25 for testing)
-# - Direct multi-vehicle Route Optimization (VRP) with Open vs Round-trip toggle
-# - Fair before/after comparison (ensures same trip type)
-# - Optional: raw Clustering API runner (paste JSON body)
-# - Lightweight backend logging (Cloud logs + in-app session logs)
+# -*- coding: utf-8 -*-
+"""
+NextBillion Routing Testbench (Streamlit)
+- Max 200 stops
+- Editable driver count
+- Baseline: greedy assignment + nearest-neighbor sequencing
+- Guided clustering (UI-generated payload + optional manual tweak before submit)
+- Separate steps with clear "next step" guidance
+"""
 
-import os
-import time
+from __future__ import annotations
+
 import json
-import uuid
+import math
+import os
 import random
-import logging
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
 import pandas as pd
+import requests
 import streamlit as st
-import folium
-from folium.plugins import PolyLineTextPath
-from streamlit_folium import st_folium
+
+# Optional map components
+try:
+    import folium
+    from streamlit_folium import st_folium
+except Exception:
+    folium = None
+    st_folium = None
 
 
 # =========================
-# CONFIG
+# Config & constants
 # =========================
+
 NB_BASE = "https://api.nextbillion.io"
-UA = {"User-Agent": "NextBillion-Routing-Testbench/1.0"}
+MAX_STOPS = 200
+DEFAULT_DRIVERS = 25
 
-st.set_page_config(page_title="NextBillion.ai — Routing Testbench", layout="wide")
-
-DEFAULT_API_KEY = st.secrets.get("NEXTBILLION_API_KEY", os.getenv("NEXTBILLION_API_KEY", ""))
-API_KEY_UI = st.sidebar.text_input("NextBillion API key", type="password", value=DEFAULT_API_KEY, help="Prefer Streamlit Secrets: NEXTBILLION_API_KEY")
-
+st.set_page_config(page_title="NextBillion Routing Testbench", layout="wide")
 
 # =========================
-# LIGHTWEIGHT LOGGING (perf-safe)
+# Utilities
 # =========================
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-def _mask_secret(s: str, keep_last: int = 4) -> str:
-    s = "" if s is None else str(s)
-    if not s:
-        return s
-    if len(s) <= keep_last:
-        return "*" * len(s)
-    return "*" * (len(s) - keep_last) + s[-keep_last:]
+def safe_json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2)
 
+def haversine_km(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    """Great-circle distance in km."""
+    lat1, lon1 = a
+    lat2, lon2 = b
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    h = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(h))
 
-def _init_logger() -> logging.Logger:
-    if "run_id" not in st.session_state:
-        st.session_state.run_id = str(uuid.uuid4())[:8]
-    if "audit_events" not in st.session_state:
-        st.session_state.audit_events = []
-    st.session_state.setdefault("audit_enabled", False)     # verbose events
-    st.session_state.setdefault("audit_state_diff", False)  # expensive
-    st.session_state.setdefault("audit_console_all", False) # cloud logs spam
-    st.session_state.setdefault("audit_max_events", 600)
-
-    logger = logging.getLogger("nb_audit")
-    if not logger.handlers:
-        h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
-        logger.addHandler(h)
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
-    return logger
-
-
-LOG = _init_logger()
-
-
-def audit(event: str, level: str = "INFO", force_console: bool = False, **fields):
-    """Logs to in-app buffer always; optionally to console (Cloud logs)."""
-    payload = {"ts": _utc_now_iso(), "run_id": st.session_state.get("run_id", ""), "event": event, **fields}
-    st.session_state.audit_events.append(payload)
-    if len(st.session_state.audit_events) > int(st.session_state.audit_max_events):
-        st.session_state.audit_events = st.session_state.audit_events[-int(st.session_state.audit_max_events):]
-
-    to_console = force_console or st.session_state.get("audit_console_all", False) or event.startswith("api_") or level == "ERROR"
-    if to_console:
-        msg = json.dumps(payload, ensure_ascii=False)
-        getattr(LOG, level.lower(), LOG.info)(msg)
-
-
-def audit_state_changes():
-    if not st.session_state.get("audit_state_diff", False):
-        return
-    snap_key = "_prev_state_snapshot"
-    prev = st.session_state.get(snap_key, {})
-    now = {}
-    # Only snapshot simple keys to avoid large diffs
-    for k, v in st.session_state.items():
-        if k.startswith("_"):
-            continue
-        if isinstance(v, (str, int, float, bool)) or v is None:
-            now[k] = v
-    # Diff
-    changed = {k: {"from": prev.get(k), "to": now.get(k)} for k in now.keys() if prev.get(k) != now.get(k)}
-    if changed:
-        audit("state_change", changes=changed)
-    st.session_state[snap_key] = now
-
-
-audit_state_changes()
-
-
-# =========================
-# HTTP HELPERS
-# =========================
-def _req(method: str, path: str, *, params: Optional[dict] = None, body: Optional[dict] = None, timeout: int = 45) -> requests.Response:
-    if not API_KEY_UI:
-        raise RuntimeError("Missing API key. Set NEXTBILLION_API_KEY in Streamlit Secrets or paste in sidebar.")
-    url = f"{NB_BASE}{path}"
-    params = dict(params or {})
-    params["key"] = API_KEY_UI
-
-    safe_params = dict(params)
-    safe_params["key"] = _mask_secret(API_KEY_UI)
-
-    t0 = time.time()
-    audit("api_request", method=method.upper(), url=url, params=safe_params, has_body=bool(body), force_console=True)
-    r = requests.request(method.upper(), url, params=params, json=body, headers=UA, timeout=timeout)
-    dt_ms = int((time.time() - t0) * 1000)
-    audit("api_response", method=method.upper(), url=str(r.url), status=r.status_code, latency_ms=dt_ms, bytes=len(r.content or b""), force_console=True)
-    return r
-
-
-def nb_geocode(query: str, country: str = "", limit: int = 5) -> dict:
-    params = {"q": query, "limit": limit}
-    if country:
-        params["country"] = country
-    r = _req("GET", "/geocode", params=params)
-    return r.json()
-
-
-def nb_directions(coords: List[Tuple[float, float]], mode: str = "car", option: str = "fast", avoid: str = "") -> dict:
-    # Directions API expects "origin" and "destination" and optionally "waypoints".
-    origin = f"{coords[0][1]},{coords[0][0]}"       # lng,lat
-    destination = f"{coords[-1][1]},{coords[-1][0]}"
-    params = {"origin": origin, "destination": destination, "mode": mode, "option": option}
-    if len(coords) > 2:
-        # waypoints: lng,lat|lng,lat
-        params["waypoints"] = "|".join([f"{lng},{lat}" for (lat, lng) in coords[1:-1]])
-    if avoid:
-        params["avoid"] = avoid
-    r = _req("GET", "/directions", params=params)
-    return r.json()
-
-
-def nb_optimize_create(payload: dict) -> dict:
-    # Route Optimization API (task)
-    r = _req("POST", "/optimization/v2", body=payload)
-    return r.json()
-
-
-def nb_optimize_result(task_id: str) -> dict:
-    r = _req("GET", "/optimization/v2/result", params={"id": task_id})
-    return r.json()
-
-
-def nb_cluster_create(payload: dict) -> dict:
-    # Clustering endpoint per docs: POST /clustering?key=... citeturn1view0
-    r = _req("POST", "/clustering", body=payload)
-    return r.json()
-
-
-def nb_cluster_result(task_id: str) -> dict:
-    # GET /clustering/result?id=...&key=... citeturn1view0
-    r = _req("GET", "/clustering/result", params={"id": task_id})
-    return r.json()
-
-
-# =========================
-# POLYLINE DECODER (polyline6 by default)
-# =========================
-def decode_polyline(polyline_str: str, precision: int = 6) -> List[Tuple[float, float]]:
-    """Decodes a Google-style encoded polyline string."""
-    if not polyline_str:
-        return []
-    index, lat, lng = 0, 0, 0
-    coordinates = []
-    factor = 10 ** precision
-
-    while index < len(polyline_str):
-        shift, result = 0, 0
-        while True:
-            b = ord(polyline_str[index]) - 63
-            index += 1
-            result |= (b & 0x1F) << shift
-            shift += 5
-            if b < 0x20:
-                break
-        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
-        lat += dlat
-
-        shift, result = 0, 0
-        while True:
-            b = ord(polyline_str[index]) - 63
-            index += 1
-            result |= (b & 0x1F) << shift
-            shift += 5
-            if b < 0x20:
-                break
-        dlng = ~(result >> 1) if (result & 1) else (result >> 1)
-        lng += dlng
-
-        coordinates.append((lat / factor, lng / factor))
-    return coordinates
-
-
-# =========================
-# DEFAULT DATA
-# =========================
-def default_stops_df() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {"stop_id": "S1", "address": "Jaipur Junction Railway Station", "lat": 26.9196, "lng": 75.7873, "tw_start": "09:00", "tw_end": "18:00"},
-            {"stop_id": "S2", "address": "Mansarovar, Jaipur", "lat": 26.8531, "lng": 75.7644, "tw_start": "10:00", "tw_end": "16:00"},
-            {"stop_id": "S3", "address": "Vaishali Nagar, Jaipur", "lat": 26.9066, "lng": 75.7385, "tw_start": "09:30", "tw_end": "17:30"},
-            {"stop_id": "S4", "address": "Malviya Nagar, Jaipur", "lat": 26.8538, "lng": 75.8120, "tw_start": "11:00", "tw_end": "18:00"},
-        ]
-    )
-
-
-def default_depots_df() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {"depot_id": "D1", "name": "Default Depot", "lat": 26.9124, "lng": 75.7873},
-        ]
-    )
-
-
-def hhmm_to_seconds(s: str) -> int:
-    """Convert HH:MM to seconds from midnight."""
+def hhmm_to_seconds(hhmm: str) -> Optional[int]:
+    """Convert HH:MM to seconds from midnight; returns None if blank/invalid."""
+    if hhmm is None:
+        return None
+    s = str(hhmm).strip()
+    if s == "":
+        return None
     try:
-        hh, mm = s.strip().split(":")
-        return int(hh) * 3600 + int(mm) * 60
+        parts = s.split(":")
+        if len(parts) != 2:
+            return None
+        h = int(parts[0]); m = int(parts[1])
+        if h < 0 or h > 23 or m < 0 or m > 59:
+            return None
+        return h * 3600 + m * 60
     except Exception:
-        return 0
+        return None
 
+def seconds_to_hhmm(sec: Optional[int]) -> str:
+    if sec is None:
+        return ""
+    sec = int(sec)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    return f"{h:02d}:{m:02d}"
 
-def seconds_to_hhmm(secs: int) -> str:
-    secs = max(0, int(secs))
-    hh = (secs // 3600) % 24
-    mm = (secs % 3600) // 60
-    return f"{hh:02d}:{mm:02d}"
-
-
-# =========================
-# SESSION INIT
-# =========================
-if "stops_df" not in st.session_state:
-    st.session_state.stops_df = default_stops_df()
-if "depots_df" not in st.session_state:
-    st.session_state.depots_df = default_depots_df()
-
-st.title("NextBillion.ai — Multi‑Driver Routing Testbench")
-st.caption("Build stops → configure 25 drivers → optimize (time windows supported) → compare directions before/after → export JSONs.")
-
-# Sidebar controls
-with st.sidebar:
-    st.subheader("Run settings")
-    mode = st.selectbox("Planner mode", ["Direct VRP (25 drivers)", "Single route (1 driver)"], index=0)
-
-    return_to_start = st.checkbox("Round trip (return to depot)", value=True,
-                                  help="When enabled, vehicle end_index is same as start_index (depot). When disabled, routes are open. The Route Optimization API supports start_index and end_index. citeturn1view1")
-
-    objective = st.selectbox("Optimization objective (travel_cost)", ["duration", "distance"], index=0,
-                             help="Controls what the solver tries to minimize (time vs distance).")
-
-    # Directions settings
-    st.subheader("Directions settings")
-    directions_mode = st.selectbox("Directions mode", ["car", "truck"], index=0)
-    directions_option = st.selectbox("Directions option", ["fast", "flexible"], index=0)
-    avoid = st.text_input("Avoid (comma-separated)", value="", help="Examples: tolls,highways. citeturn0search2")
-
-    # Debug toggles
-    st.subheader("Debug")
-    st.session_state.audit_enabled = st.toggle("Enable verbose audit (slower)", value=st.session_state.audit_enabled)
-    st.session_state.audit_state_diff = st.toggle("Track widget state diffs (slow)", value=st.session_state.audit_state_diff)
-    st.session_state.audit_console_all = st.toggle("Log ALL events to Cloud logs (slow)", value=st.session_state.audit_console_all)
-
-
-tabs = st.tabs(["Stops", "Depots / Drivers", "Optimize", "Results", "Clustering (raw)", "Logs"])
-
-# -------------------------
-# Stops tab
-# -------------------------
-with tabs[0]:
-    st.subheader("Stops")
-    st.write("Edit stops here. For time windows, use HH:MM (same-day).")
-    df = st.session_state.stops_df.copy()
-
-    edited = st.data_editor(
-        df,
-        num_rows="dynamic",
-        width="stretch",
-        key="stops_editor",
-        column_config={
-            "stop_id": st.column_config.TextColumn(required=True),
-            "address": st.column_config.TextColumn(),
-            "lat": st.column_config.NumberColumn(format="%.6f"),
-            "lng": st.column_config.NumberColumn(format="%.6f"),
-            "tw_start": st.column_config.TextColumn(help="HH:MM"),
-            "tw_end": st.column_config.TextColumn(help="HH:MM"),
-        },
-    )
-    st.session_state.stops_df = edited
-
-    colA, colB, colC = st.columns([1, 1, 2])
-    with colA:
-        if st.button("Reset sample stops", width="content"):
-            st.session_state.stops_df = default_stops_df()
-            audit("button_clicked", widget="reset_sample_stops")
-            st.rerun()
-
-    with colB:
-        country = st.text_input("Country filter (optional)", value="IN", help="Helps geocode precision.")
-    with colC:
-        st.write("Geocode helper: enter an address and click search.")
-        q = st.text_input("Geocode query", value="", key="geocode_query")
-        if st.button("Geocode lookup", width="content"):
-            audit("button_clicked", widget="geocode_lookup", query=q)
-            try:
-                res = nb_geocode(q, country=country.strip(), limit=5)
-                st.session_state.last_geocode_json = res
-                st.json(res)
-            except Exception as e:
-                audit("error", where="geocode_lookup", msg=str(e), level="ERROR")
-                st.error(str(e))
-
-    if st.session_state.get("last_geocode_json"):
-        st.download_button(
-            "Download last Geocode JSON",
-            data=json.dumps(st.session_state.last_geocode_json, ensure_ascii=False),
-            file_name="geocode_last.json",
-            mime="application/json",
-            width="content",
+def init_state():
+    ss = st.session_state
+    if "run_id" not in ss:
+        ss.run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    if "seed" not in ss:
+        ss.seed = 42
+    if "stops_df" not in ss:
+        ss.stops_df = pd.DataFrame(columns=["stop_id", "address", "lat", "lng", "tw_start", "tw_end"])
+    if "depots_df" not in ss:
+        ss.depots_df = pd.DataFrame(
+            [{"depot_id": "D1", "name": "Depot 1", "lat": 26.9124, "lng": 75.7873}]
         )
+    if "driver_cfg" not in ss:
+        ss.driver_cfg = {
+            "driver_count": DEFAULT_DRIVERS,
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "depot_mode": "single_depot",  # single_depot | multi_depot_random | open_route
+            "route_type": "open",          # open | round_trip
+        }
+    if "routing_cfg" not in ss:
+        ss.routing_cfg = {
+            "mode": "car",
+            "option": "fast",  # for navigation/directions where applicable
+            "avoid": "",
+        }
+    if "objective" not in ss:
+        ss.objective = "duration"  # duration | distance
+    if "planner_mode" not in ss:
+        ss.planner_mode = "Direct VRP"  # Direct VRP | Cluster-first
+    if "validated" not in ss:
+        ss.validated = False
 
-# -------------------------
-# Depots / Drivers tab
-# -------------------------
-with tabs[1]:
-    st.subheader("Depots & Driver setup")
+    # Clustering state
+    if "cluster_task_id" not in ss:
+        ss.cluster_task_id = ""
+    if "cluster_create_payload" not in ss:
+        ss.cluster_create_payload = {}
+    if "cluster_result" not in ss:
+        ss.cluster_result = {}
 
-    depots_df = st.session_state.depots_df.copy()
-    st.write("Add one or more candidate depots. For multi-depot testing, add several.")
-    depots_edit = st.data_editor(
-        depots_df,
-        num_rows="dynamic",
-        width="stretch",
-        key="depots_editor",
-        column_config={
-            "depot_id": st.column_config.TextColumn(required=True),
-            "name": st.column_config.TextColumn(),
-            "lat": st.column_config.NumberColumn(format="%.6f"),
-            "lng": st.column_config.NumberColumn(format="%.6f"),
-        },
-    )
-    st.session_state.depots_df = depots_edit
+    # Optimization state
+    if "opt_task_id" not in ss:
+        ss.opt_task_id = ""
+    if "opt_create_payload" not in ss:
+        ss.opt_create_payload = {}
+    if "opt_result" not in ss:
+        ss.opt_result = {}
 
-    st.divider()
-    st.subheader("Driver / Vehicle generator (testing)")
-    driver_count = st.number_input("Number of drivers (vehicles)", min_value=1, max_value=200, value=25, step=1)
-    shift_start = st.text_input("Shift start (HH:MM)", value="09:00")
-    shift_end = st.text_input("Shift end (HH:MM)", value="18:00")
+    # Baseline state
+    if "baseline_assignment" not in ss:
+        ss.baseline_assignment = {}  # vehicle_id -> list[stop_id]
+    if "baseline_routes" not in ss:
+        ss.baseline_routes = {}      # vehicle_id -> ordered stop_id list
 
-    depot_mode = st.selectbox(
-        "Depot mode",
-        ["Single depot for all drivers (use first depot)", "Random depot per driver (from list)", "Open route: start at first job (no depot)"],
-        index=0,
-        help="Route Optimization supports specifying vehicle start/end locations via start_index/end_index (location list indices). citeturn1view1",
-    )
+    # Directions/Navigation state
+    if "dir_optimized" not in ss:
+        ss.dir_optimized = {}        # vehicle_id -> directions json
+    if "dir_baseline" not in ss:
+        ss.dir_baseline = {}         # vehicle_id -> directions json
 
-    st.info(
-        "Note on 'depot can change': the solver won’t invent depot locations — it can only use the depot candidates you provide. "
-        "So 'dynamic depot' = choose from your depot list (random or per driver), or use open routes."
-    )
+    # Logs
+    if "log_rows" not in ss:
+        ss.log_rows = []  # list[dict]
 
-# -------------------------
-# Optimize tab
-# -------------------------
-def build_vrp_payload(
-    stops: pd.DataFrame,
-    depots: pd.DataFrame,
-    *,
-    mode: str,
-    driver_count: int,
-    depot_mode: str,
-    return_to_start: bool,
-    objective: str,
-    shift_start: str,
-    shift_end: str,
-) -> Tuple[dict, List[Tuple[float, float]], Dict[int, str]]:
-    """
-    Returns:
-    - payload for /optimization/v2
-    - locations list (lat,lng) in index order
-    - location_index -> label mapping for UI
-    """
-    # Build locations list: [depots..., stops...]
-    locs: List[Tuple[float, float]] = []
-    loc_labels: Dict[int, str] = {}
+def log_event(level: str, msg: str, **fields):
+    row = {"ts": now_iso(), "level": level, "msg": msg}
+    row.update(fields)
+    st.session_state.log_rows.append(row)
+    # Keep log size bounded for performance
+    if len(st.session_state.log_rows) > 2000:
+        st.session_state.log_rows = st.session_state.log_rows[-1500:]
 
-    # Depots first
-    for _, d in depots.iterrows():
-        loc_labels[len(locs)] = f"DEPOT:{d.get('depot_id','')}"
-        locs.append((float(d["lat"]), float(d["lng"])))
+def nb_key() -> str:
+    # Prefer Streamlit secrets; fallback to environment variable; fallback to empty
+    return st.secrets.get("NEXTBILLION_API_KEY", os.getenv("NEXTBILLION_API_KEY", ""))
 
-    depot_count = len(locs)
-
-    # Stops next
-    for _, s in stops.iterrows():
-        loc_labels[len(locs)] = f"STOP:{s.get('stop_id','')}"
-        locs.append((float(s["lat"]), float(s["lng"])))
-
-    # Jobs reference stop locations by index
-    jobs = []
-    for i, s in enumerate(stops.itertuples(index=False), start=0):
-        location_index = depot_count + i
-        tw_start = hhmm_to_seconds(getattr(s, "tw_start", "") or "00:00")
-        tw_end = hhmm_to_seconds(getattr(s, "tw_end", "") or "23:59")
-        # Route Optimization API jobs can include time_windows; schema described in docs. citeturn1view1
-        jobs.append(
-            {
-                "id": int(i + 1),  # must be non-zero positive int in many NB APIs
-                "location_index": int(location_index),
-                "service": 0,  # no service time (your requirement)
-                "time_windows": [[int(tw_start), int(tw_end)]],
-            }
-        )
-
-    # Vehicles
-    vehicles = []
-    ss = hhmm_to_seconds(shift_start)
-    se = hhmm_to_seconds(shift_end)
-    if se <= ss:
-        se = ss + 8 * 3600
-
-    def pick_start_index(v_i: int) -> Optional[int]:
-        if depot_mode.startswith("Open route"):
-            return None
-        if depot_count <= 0:
-            return None
-        if depot_mode.startswith("Random depot"):
-            return int(v_i % depot_count)
-        return 0
-
-    for v in range(int(driver_count)):
-        start_idx = pick_start_index(v)
-        # end_idx logic: if open route -> omit; else round trip vs open
-        if start_idx is None:
-            # open route with no explicit depot
-            veh = {"id": int(v + 1)}
-        else:
-            end_idx = int(start_idx) if return_to_start else int(start_idx)  # for open routes with depot, we still set end_index below
-            # If not returning to depot, leave end_index unspecified to allow solver to end at last job.
-            veh = {"id": int(v + 1), "start_index": int(start_idx)}
-            if return_to_start:
-                veh["end_index"] = int(start_idx)
-        # Shift window (vehicle availability)
-        veh["time_window"] = [int(ss), int(se)]
-        vehicles.append(veh)
-
-    payload = {
-        "description": f"Routing testbench | {mode} | drivers={driver_count}",
-        "locations": {"id": 1, "location": [[lng, lat] for (lat, lng) in locs]},  # NB uses [lng,lat] in many APIs
-        "jobs": jobs,
-        "vehicles": vehicles,
-        "options": {"objective": {"travel_cost": objective}},
-    }
-
-    return payload, locs, loc_labels
-
-
-def parse_vrp_routes(opt_result: dict) -> List[dict]:
-    """
-    Attempts to parse routes from 'result' which may be JSON string.
-    """
-    if not opt_result:
-        return []
-    r = opt_result.get("result")
-    if isinstance(r, str):
+def http_get(url: str, params: Optional[dict] = None, timeout: int = 60) -> dict:
+    t0 = time.time()
+    try:
+        r = requests.get(url, params=params, timeout=timeout)
+        dt = round((time.time() - t0) * 1000)
+        log_event("INFO", "GET", url=url, status=r.status_code, ms=dt)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as e:
+        dt = round((time.time() - t0) * 1000)
+        body = ""
         try:
-            r = json.loads(r)
-        except Exception:
-            return []
-    if not isinstance(r, dict):
-        return []
-    return r.get("routes", []) or []
-
-
-def route_steps_to_location_indices(route: dict) -> List[int]:
-    steps = route.get("steps", []) or []
-    out = []
-    for s in steps:
-        # Steps contain either location_index or embedded location index. Existing NextBillion examples include location_index.
-        li = s.get("location_index")
-        if li is None and "job" in s:
-            # sometimes job steps have job id; not enough to map without lookup
-            continue
-        if li is not None:
-            out.append(int(li))
-    # Deduplicate consecutive duplicates
-    cleaned = []
-    for x in out:
-        if not cleaned or cleaned[-1] != x:
-            cleaned.append(x)
-    return cleaned
-
-
-with tabs[2]:
-    st.subheader("Optimize")
-    stops = st.session_state.stops_df.copy()
-    depots = st.session_state.depots_df.copy()
-
-    if len(stops) < 2:
-        st.warning("Add at least 2 stops to optimize.")
-    else:
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            if st.button("Create optimization job", width="stretch"):
-                audit("button_clicked", widget="create_optimization_job")
-                try:
-                    payload, locs, loc_labels = build_vrp_payload(
-                        stops,
-                        depots,
-                        mode=mode,
-                        driver_count=1 if mode.startswith("Single") else int(driver_count),
-                        depot_mode=depot_mode,
-                        return_to_start=return_to_start,
-                        objective=objective,
-                        shift_start=shift_start,
-                        shift_end=shift_end,
-                    )
-                    st.session_state.last_opt_create_payload = payload
-                    res = nb_optimize_create(payload)
-                    st.session_state.last_opt_create_json = res
-                    task_id = res.get("id") or res.get("task_id")
-                    st.session_state.last_opt_task_id = task_id
-                    st.success(f"Optimization job created: {task_id}")
-                    st.json(res)
-                except Exception as e:
-                    audit("error", where="create_optimization_job", msg=str(e), level="ERROR")
-                    st.error(str(e))
-
-        with col2:
-            if st.button("Fetch optimization result", width="stretch"):
-                audit("button_clicked", widget="fetch_optimization_result")
-                try:
-                    task_id = st.session_state.get("last_opt_task_id")
-                    if not task_id:
-                        st.error("No task id yet. Create job first.")
-                    else:
-                        res = nb_optimize_result(task_id)
-                        st.session_state.last_opt_result_json = res
-                        st.json(res)
-                except Exception as e:
-                    audit("error", where="fetch_optimization_result", msg=str(e), level="ERROR")
-                    st.error(str(e))
-
-        # Downloads
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.session_state.get("last_opt_create_payload"):
-                st.download_button(
-                    "Download last Optimization Create Payload",
-                    data=json.dumps(st.session_state.last_opt_create_payload, ensure_ascii=False),
-                    file_name="opt_create_last.json",
-                    mime="application/json",
-                    width="content",
-                )
-        with c2:
-            if st.session_state.get("last_opt_result_json"):
-                st.download_button(
-                    "Download last Optimization Result JSON",
-                    data=json.dumps(st.session_state.last_opt_result_json, ensure_ascii=False),
-                    file_name="opt_result_last.json",
-                    mime="application/json",
-                    width="content",
-                )
-
-# -------------------------
-# Results tab (map + fair compare)
-# -------------------------
-def compute_directions_metrics(d: dict) -> Tuple[float, float]:
-    """Return (distance_m, duration_s) for first route."""
-    if not d or d.get("status") != "Ok":
-        return (0.0, 0.0)
-    r0 = (d.get("routes") or [{}])[0]
-    return float(r0.get("distance", 0.0)), float(r0.get("duration", 0.0))
-
-
-def build_baseline_order(stops: pd.DataFrame, depots: pd.DataFrame, return_to_start: bool, depot_mode: str) -> List[Tuple[float, float]]:
-    coords = [(float(x["lat"]), float(x["lng"])) for _, x in stops.iterrows()]
-    if depot_mode.startswith("Open route"):
-        # no explicit depot; baseline is just stops in given order
-        if return_to_start:
-            # round trip requested but no depot: close at first stop
-            coords = coords + [coords[0]]
-        return coords
-
-    # Use first depot as baseline depot
-    if len(depots) == 0:
-        if return_to_start:
-            coords = coords + [coords[0]]
-        return coords
-
-    depot = (float(depots.iloc[0]["lat"]), float(depots.iloc[0]["lng"]))
-    if return_to_start:
-        return [depot] + coords + [depot]
-    else:
-        # open route: start at depot, end at last stop
-        return [depot] + coords
-
-
-def folium_map_for_route(coords: List[Tuple[float, float]], geometry: str = "", labels: Optional[List[str]] = None) -> folium.Map:
-    if not coords:
-        return folium.Map(location=[0, 0], zoom_start=2)
-
-    m = folium.Map(location=[coords[0][0], coords[0][1]], zoom_start=12)
-    # markers
-    for i, (lat, lng) in enumerate(coords):
-        label = labels[i] if labels and i < len(labels) else f"{i}"
-        folium.Marker(
-            [lat, lng],
-            tooltip=label,
-            icon=folium.DivIcon(html=f"""
-                <div style="font-size: 12px; color: white; background: #017dff;
-                            border-radius: 999px; width: 24px; height: 24px;
-                            display:flex; align-items:center; justify-content:center;
-                            border:2px solid white; box-shadow:0 1px 3px rgba(0,0,0,.35);">
-                    {i}
-                </div>
-            """),
-        ).add_to(m)
-
-    # polyline from geometry (preferred) or straight lines
-    pts = decode_polyline(geometry, precision=6) if geometry else coords
-    if pts and len(pts) >= 2:
-        pl = folium.PolyLine(pts, weight=5, opacity=0.8)
-        pl.add_to(m)
-        try:
-            PolyLineTextPath(pl, "➤", repeat=True, offset=7, attributes={"font-size": "16", "fill": "black"}).add_to(m)
+            body = r.text[:2000]  # type: ignore
         except Exception:
             pass
-    return m
+        log_event("ERROR", "GET failed", url=url, ms=dt, error=str(e), body=body)
+        raise
 
+def http_post(url: str, payload: dict, params: Optional[dict] = None, timeout: int = 120) -> dict:
+    t0 = time.time()
+    try:
+        r = requests.post(url, params=params, json=payload, timeout=timeout)
+        dt = round((time.time() - t0) * 1000)
+        log_event("INFO", "POST", url=url, status=r.status_code, ms=dt)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as e:
+        dt = round((time.time() - t0) * 1000)
+        body = ""
+        try:
+            body = r.text[:2000]
+        except Exception:
+            pass
+        log_event("ERROR", "POST failed", url=url, ms=dt, error=str(e), body=body)
+        raise
 
-with tabs[3]:
-    st.subheader("Results & Comparison")
+def next_step_banner():
+    ss = st.session_state
+    steps = []
+    steps.append(("Validated", ss.validated))
+    if ss.planner_mode == "Cluster-first":
+        steps.append(("Cluster created", bool(ss.cluster_task_id)))
+        steps.append(("Cluster fetched", bool(ss.cluster_result)))
+    steps.append(("Optimization created", bool(ss.opt_task_id)))
+    steps.append(("Optimization fetched", bool(ss.opt_result)))
+    steps.append(("Baseline built", bool(ss.baseline_routes)))
+    steps.append(("Directions (opt) ready", bool(ss.dir_optimized)))
+    steps.append(("Directions (baseline) ready", bool(ss.dir_baseline)))
 
-    stops = st.session_state.stops_df.copy()
-    depots = st.session_state.depots_df.copy()
-
-    if len(stops) < 2:
-        st.warning("Need at least 2 stops.")
+    # Determine next suggestion
+    if not ss.validated:
+        suggestion = "Next: Validate Inputs"
+    elif ss.planner_mode == "Cluster-first" and not ss.cluster_task_id:
+        suggestion = "Next: Create Clustering Job"
+    elif ss.planner_mode == "Cluster-first" and ss.cluster_task_id and not ss.cluster_result:
+        suggestion = "Next: Fetch Clustering Result"
+    elif not ss.opt_task_id:
+        suggestion = "Next: Create Optimization Job"
+    elif ss.opt_task_id and not ss.opt_result:
+        suggestion = "Next: Fetch Optimization Result"
+    elif not ss.baseline_routes:
+        suggestion = "Next: Build Baseline (Greedy + Nearest-Neighbor)"
+    elif not ss.dir_optimized:
+        suggestion = "Next: Run Directions for Optimized Routes"
+    elif not ss.dir_baseline:
+        suggestion = "Next: Run Directions for Baseline Routes"
     else:
-        # Baseline
-        if st.button("Run baseline Directions (fair compare)", width="stretch"):
-            audit("button_clicked", widget="baseline_directions")
-            try:
-                base_coords = build_baseline_order(stops, depots, return_to_start=return_to_start, depot_mode=depot_mode)
-                d0 = nb_directions(base_coords, mode=directions_mode, option=directions_option, avoid=avoid.strip())
-                st.session_state.directions_before = d0
-                st.success("Baseline directions computed.")
-            except Exception as e:
-                audit("error", where="baseline_directions", msg=str(e), level="ERROR")
-                st.error(str(e))
+        suggestion = "Next: Review & Export"
 
-        # Optimized routes -> directions
-        st.write("Compute directions for optimized routes. For performance, you can limit how many driver routes to fetch.")
-        max_routes = st.number_input("Max driver routes to fetch directions for", min_value=1, max_value=25, value=5, step=1)
+    cols = st.columns([3, 2])
+    with cols[0]:
+        badges = "  ".join([f"✅ {name}" if ok else f"⬜ {name}" for name, ok in steps])
+        st.markdown(badges)
+    with cols[1]:
+        st.info(suggestion)
 
-        if st.button("Run Directions for optimized solution", width="stretch"):
-            audit("button_clicked", widget="optimized_directions")
-            try:
-                opt = st.session_state.get("last_opt_result_json")
-                if not opt:
-                    st.error("Fetch optimization result first (Optimize tab).")
+def validate_inputs() -> Tuple[bool, List[str]]:
+    ss = st.session_state
+    errs = []
+
+    stops = ss.stops_df.copy()
+    if len(stops) == 0:
+        errs.append("No stops loaded.")
+    if len(stops) > MAX_STOPS:
+        errs.append(f"Stop limit exceeded: {len(stops)} > {MAX_STOPS}")
+
+    for col in ["lat", "lng"]:
+        if col not in stops.columns:
+            errs.append(f"Stops missing column '{col}'.")
+        else:
+            bad = stops[col].isna().sum()
+            if bad:
+                errs.append(f"Stops have {bad} missing values in '{col}'.")
+
+    if "stop_id" not in stops.columns:
+        errs.append("Stops missing 'stop_id'.")
+    else:
+        if stops["stop_id"].astype(str).str.strip().eq("").any():
+            errs.append("Some stops have empty stop_id.")
+        if stops["stop_id"].duplicated().any():
+            errs.append("Duplicate stop_id values found.")
+
+    # Depots
+    depots = ss.depots_df.copy()
+    if depots.empty and ss.driver_cfg["depot_mode"] != "open_route":
+        errs.append("No depots provided (required unless using open routes).")
+    else:
+        for col in ["lat", "lng"]:
+            if col not in depots.columns:
+                errs.append(f"Depots missing column '{col}'.")
+            else:
+                if depots[col].isna().sum():
+                    errs.append(f"Some depots have missing {col}.")
+
+    # Drivers
+    try:
+        n = int(ss.driver_cfg["driver_count"])
+        if n <= 0:
+            errs.append("Driver count must be > 0.")
+    except Exception:
+        errs.append("Driver count must be an integer.")
+
+    # Time windows
+    if "tw_start" in stops.columns and "tw_end" in stops.columns:
+        for i, row in stops.iterrows():
+            s = hhmm_to_seconds(row.get("tw_start", ""))
+            e = hhmm_to_seconds(row.get("tw_end", ""))
+            if (s is None) != (e is None):
+                errs.append(f"Stop {row.get('stop_id')} has only one side of time window filled.")
+                break
+            if s is not None and e is not None and s >= e:
+                errs.append(f"Stop {row.get('stop_id')} has invalid time window (start >= end).")
+                break
+
+    ok = len(errs) == 0
+    return ok, errs
+
+def generate_stops(seed: int, n: int, preset: str, center: Tuple[float, float], jitter_m: int,
+                   tw_pct: int, tw_preset: str) -> pd.DataFrame:
+    rng = random.Random(seed)
+    lat0, lng0 = center
+
+    def jitter_point(lat, lng, meters):
+        # Rough conversion: 1 deg lat ~ 111km, lng scaled by cos(lat)
+        dlat = (rng.uniform(-meters, meters) / 1000.0) / 111.0
+        dlng = (rng.uniform(-meters, meters) / 1000.0) / (111.0 * max(0.2, math.cos(math.radians(lat))))
+        return lat + dlat, lng + dlng
+
+    points = []
+    if preset == "Dense":
+        for i in range(n):
+            lat, lng = jitter_point(lat0, lng0, jitter_m)
+            points.append((lat, lng))
+    elif preset == "3 pockets":
+        pockets = [jitter_point(lat0, lng0, jitter_m * 4) for _ in range(3)]
+        for i in range(n):
+            base = pockets[i % 3]
+            lat, lng = jitter_point(base[0], base[1], jitter_m)
+            points.append((lat, lng))
+    elif preset == "Mixed":
+        for i in range(n):
+            m = jitter_m if rng.random() < 0.7 else jitter_m * 8
+            lat, lng = jitter_point(lat0, lng0, m)
+            points.append((lat, lng))
+    else:  # Long tail
+        for i in range(n):
+            m = jitter_m if rng.random() < 0.8 else jitter_m * 15
+            lat, lng = jitter_point(lat0, lng0, m)
+            points.append((lat, lng))
+
+    rows = []
+    for i, (lat, lng) in enumerate(points, start=1):
+        tw_start = ""
+        tw_end = ""
+        if rng.randint(1, 100) <= tw_pct:
+            if tw_preset == "Loose":
+                tw_start, tw_end = "09:00", "18:00"
+            elif tw_preset == "Waves":
+                wave = (i % 3)
+                if wave == 0:
+                    tw_start, tw_end = "09:00", "12:00"
+                elif wave == 1:
+                    tw_start, tw_end = "11:00", "14:00"
                 else:
-                    routes = parse_vrp_routes(opt)
-                    if not routes:
-                        st.error("No routes found in optimization result.")
-                    else:
-                        # Build map from location indices to coordinates
-                        # Rebuild locations mapping from latest payload
-                        payload = st.session_state.get("last_opt_create_payload")
-                        if not payload:
-                            st.error("Missing last optimization payload. Re-run optimization create.")
-                        else:
-                            loc_arr = payload.get("locations", {}).get("location", [])
-                            # loc_arr is [[lng,lat], ...]
-                            locs = [(float(latlng[1]), float(latlng[0])) for latlng in loc_arr]
+                    tw_start, tw_end = "13:00", "18:00"
+            else:  # Tight
+                # Tight random window of 60-120 minutes between 09:00 and 18:00
+                start = rng.randint(9 * 60, 16 * 60)
+                dur = rng.randint(60, 120)
+                end = min(start + dur, 18 * 60)
+                tw_start = f"{start//60:02d}:{start%60:02d}"
+                tw_end = f"{end//60:02d}:{end%60:02d}"
 
-                            dirs_by_vehicle = {}
-                            for r in routes[: int(max_routes)]:
-                                vehicle_id = r.get("vehicle")
-                                idxs = route_steps_to_location_indices(r)
-                                if len(idxs) < 2:
-                                    continue
-                                coords = [locs[i] for i in idxs]
-                                d = nb_directions(coords, mode=directions_mode, option=directions_option, avoid=avoid.strip())
-                                dirs_by_vehicle[str(vehicle_id)] = {"indices": idxs, "directions": d}
-                            st.session_state.directions_after_by_vehicle = dirs_by_vehicle
-                            st.success(f"Computed directions for {len(dirs_by_vehicle)} route(s).")
-            except Exception as e:
-                audit("error", where="optimized_directions", msg=str(e), level="ERROR")
-                st.error(str(e))
+        rows.append({
+            "stop_id": f"S{i}",
+            "address": "",
+            "lat": round(lat, 6),
+            "lng": round(lng, 6),
+            "tw_start": tw_start,
+            "tw_end": tw_end,
+        })
 
-        # Show metrics + maps
-        colL, colR = st.columns(2)
+    return pd.DataFrame(rows)
 
-        with colL:
-            st.markdown("### Baseline (Before)")
-            d0 = st.session_state.get("directions_before")
-            if d0:
-                dist_m, dur_s = compute_directions_metrics(d0)
-                st.metric("Distance", f"{dist_m/1000:.2f} km")
-                st.metric("Duration", f"{dur_s/60:.1f} min")
-                geom = (d0.get("routes") or [{}])[0].get("geometry", "")
-                # coords used for baseline map
-                base_coords = build_baseline_order(stops, depots, return_to_start=return_to_start, depot_mode=depot_mode)
-                m = folium_map_for_route(base_coords, geometry=geom, labels=["B"] * len(base_coords))
-                st_folium(m, height=420, width="100%")
-                st.download_button("Download baseline directions JSON", data=json.dumps(d0, ensure_ascii=False), file_name="directions_before.json", mime="application/json", width="content")
+def assign_depots_to_vehicles(dep_df: pd.DataFrame, driver_count: int, depot_mode: str, seed: int) -> List[Optional[Tuple[float, float]]]:
+    rng = random.Random(seed)
+    depots = [(float(r["lat"]), float(r["lng"])) for _, r in dep_df.iterrows()] if not dep_df.empty else []
+    starts: List[Optional[Tuple[float, float]]] = []
+    if depot_mode == "open_route":
+        return [None] * driver_count
+    if not depots:
+        return [None] * driver_count
+    if depot_mode == "single_depot":
+        return [depots[0]] * driver_count
+    # multi_depot_random
+    for _ in range(driver_count):
+        starts.append(rng.choice(depots))
+    return starts
+
+def greedy_assign_stops_to_vehicles(
+    stops_df: pd.DataFrame,
+    vehicle_starts: List[Optional[Tuple[float, float]]],
+    seed: int,
+) -> Dict[str, List[str]]:
+    """
+    Greedy assignment: iterate stops in a seeded order and assign each stop to the vehicle
+    that yields the smallest incremental straight-line distance from that vehicle's last point.
+    Then we sequence within each vehicle using nearest neighbor.
+    """
+    rng = random.Random(seed)
+    stops = stops_df[["stop_id", "lat", "lng"]].copy()
+    stops["lat"] = stops["lat"].astype(float)
+    stops["lng"] = stops["lng"].astype(float)
+
+    stop_rows = stops.to_dict("records")
+    rng.shuffle(stop_rows)
+
+    vehicle_last = []
+    for s in vehicle_starts:
+        if s is None:
+            vehicle_last.append(None)
+        else:
+            vehicle_last.append(s)
+
+    assigned: Dict[str, List[str]] = {f"V{i+1}": [] for i in range(len(vehicle_starts))}
+    last_point: Dict[str, Optional[Tuple[float, float]]] = {f"V{i+1}": vehicle_last[i] for i in range(len(vehicle_starts))}
+
+    for row in stop_rows:
+        sid = str(row["stop_id"])
+        p = (float(row["lat"]), float(row["lng"]))
+        best_v = None
+        best_cost = None
+
+        for i in range(len(vehicle_starts)):
+            vid = f"V{i+1}"
+            lp = last_point[vid]
+            if lp is None:
+                # if open route and no last point, cost is 0 (vehicle can start here)
+                cost = 0.0
             else:
-                st.info("Run baseline directions first.")
+                cost = haversine_km(lp, p)
 
-        with colR:
-            st.markdown("### Optimized (After)")
-            dirs = st.session_state.get("directions_after_by_vehicle", {})
-            if dirs:
-                # Aggregate metrics across fetched routes
-                total_d_m = 0.0
-                total_t_s = 0.0
-                rows = []
-                for vid, pack in dirs.items():
-                    d = pack["directions"]
-                    dm, ts = compute_directions_metrics(d)
-                    total_d_m += dm
-                    total_t_s += ts
-                    rows.append({"vehicle": vid, "distance_km": dm/1000, "duration_min": ts/60})
-                st.metric("Total distance (fetched routes)", f"{total_d_m/1000:.2f} km")
-                st.metric("Total duration (fetched routes)", f"{total_t_s/60:.1f} min")
-                st.dataframe(pd.DataFrame(rows).sort_values("vehicle"), width="stretch")
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_v = vid
 
-                # Show one route map (select)
-                sel = st.selectbox("View route for vehicle", options=[r["vehicle"] for r in rows], index=0)
-                chosen = dirs[str(sel)]
-                idxs = chosen["indices"]
-                payload = st.session_state.get("last_opt_create_payload")
-                loc_arr = payload.get("locations", {}).get("location", [])
-                locs = [(float(latlng[1]), float(latlng[0])) for latlng in loc_arr]
-                coords = [locs[i] for i in idxs]
-                geom = (chosen["directions"].get("routes") or [{}])[0].get("geometry", "")
-                m = folium_map_for_route(coords, geometry=geom, labels=[str(i) for i in idxs])
-                st_folium(m, height=420, width="100%")
+        assigned[best_v].append(sid)  # type: ignore
+        # update last point for that vehicle
+        last_point[best_v] = p  # type: ignore
 
-                st.download_button(
-                    "Download optimized directions bundle (JSON)",
-                    data=json.dumps(dirs, ensure_ascii=False),
-                    file_name="directions_after_by_vehicle.json",
-                    mime="application/json",
-                    width="content",
-                )
-            else:
-                st.info("Run 'Directions for optimized solution' to populate per-vehicle routes.")
+    return assigned
 
-# -------------------------
-# Clustering tab (raw runner)
-# -------------------------
-with tabs[4]:
-    st.subheader("Clustering API (raw)")
-    st.write(
-        "This tab lets you run Clustering API without guessing request schema. "
-        "Paste your JSON request body, submit, then fetch result by ID. "
-        "Endpoints: POST /clustering and GET /clustering/result per docs. citeturn1view0"
-    )
-    example = {
-        "description": "My clustering test",
-        "routing": {"mode": "car", "option": "fast"},
-        "jobs": [
-            {"id": 1, "location": [75.7873, 26.9124]},
-            {"id": 2, "location": [75.7644, 26.8531]},
-        ],
-        "clustering": {"max_cluster_radius": 5000},
+def nearest_neighbor_order(points: List[Tuple[str, Tuple[float, float]]], start: Optional[Tuple[float, float]]) -> List[str]:
+    """Nearest-neighbor sequencing for a list of (stop_id, (lat,lng))."""
+    remaining = points.copy()
+    ordered: List[str] = []
+    cur = start
+    while remaining:
+        if cur is None:
+            # open route: pick any first (deterministic: smallest id)
+            remaining.sort(key=lambda x: x[0])
+            sid, p = remaining.pop(0)
+            ordered.append(sid)
+            cur = p
+            continue
+        # pick nearest
+        best_idx = 0
+        best_d = None
+        for i, (sid, p) in enumerate(remaining):
+            d = haversine_km(cur, p)
+            if best_d is None or d < best_d:
+                best_d = d
+                best_idx = i
+        sid, p = remaining.pop(best_idx)
+        ordered.append(sid)
+        cur = p
+    return ordered
+
+def build_baseline_routes(stops_df: pd.DataFrame, vehicle_starts: List[Optional[Tuple[float, float]]], seed: int) -> Dict[str, List[str]]:
+    assigned = greedy_assign_stops_to_vehicles(stops_df, vehicle_starts, seed)
+    pts_by_id = {str(r["stop_id"]): (float(r["lat"]), float(r["lng"])) for _, r in stops_df.iterrows()}
+    routes: Dict[str, List[str]] = {}
+    for i, start in enumerate(vehicle_starts):
+        vid = f"V{i+1}"
+        pts = [(sid, pts_by_id[sid]) for sid in assigned.get(vid, []) if sid in pts_by_id]
+        routes[vid] = nearest_neighbor_order(pts, start=start)
+    return routes
+
+def build_opt_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, cfg: dict, objective: str, seed: int) -> dict:
+    """
+    Build a minimal Route Optimization payload.
+    Docs confirm:
+    - POST https://api.nextbillion.io/optimization/v2?key=...
+    - GET  https://api.nextbillion.io/optimization/v2/result?id=...&key=...
+    - Round trip by setting start_index == end_index (same location index).
+    """
+    driver_count = int(cfg["driver_count"])
+    depot_mode = cfg["depot_mode"]
+    route_type = cfg["route_type"]
+
+    # Locations array: all depots first, then stops
+    locations: List[str] = []
+    depot_coords = []
+    if depot_mode != "open_route" and not depots_df.empty:
+        for _, r in depots_df.iterrows():
+            depot_coords.append((float(r["lat"]), float(r["lng"])))
+            locations.append(f"{float(r['lat'])},{float(r['lng'])}")
+
+    stop_index_offset = len(locations)
+    for _, r in stops_df.iterrows():
+        locations.append(f"{float(r['lat'])},{float(r['lng'])}")
+
+    # Build jobs
+    jobs = []
+    for idx, r in stops_df.reset_index(drop=True).iterrows():
+        job = {
+            "id": int(idx + 1),  # clustering/optimization docs prefer positive integers
+            "location_index": stop_index_offset + idx,
+        }
+        tws = hhmm_to_seconds(r.get("tw_start", ""))
+        twe = hhmm_to_seconds(r.get("tw_end", ""))
+        if tws is not None and twe is not None:
+            job["time_windows"] = [{"start": tws, "end": twe}]
+        jobs.append(job)
+
+    # Vehicle starts
+    vehicle_starts = assign_depots_to_vehicles(depots_df, driver_count, depot_mode, seed)
+    shift_start = hhmm_to_seconds(cfg.get("shift_start", "09:00")) or 9 * 3600
+    shift_end = hhmm_to_seconds(cfg.get("shift_end", "18:00")) or 18 * 3600
+
+    vehicles = []
+    for i in range(driver_count):
+        v = {
+            "id": int(i + 1),
+            "time_window": {"start": shift_start, "end": shift_end},
+        }
+        if depot_mode == "open_route" or not depot_coords:
+            # open routes: no explicit start/end indices
+            pass
+        else:
+            start_coord = vehicle_starts[i] or depot_coords[0]
+            # find index in depot_coords
+            try:
+                depot_idx = depot_coords.index(start_coord)
+            except ValueError:
+                depot_idx = 0
+            v["start_index"] = depot_idx
+            if route_type == "round_trip":
+                v["end_index"] = depot_idx
+        vehicles.append(v)
+
+    options: Dict[str, Any] = {"objective": {"travel_cost": objective}}
+    payload = {
+        "locations": locations,
+        "jobs": jobs,
+        "vehicles": vehicles,
+        "options": options,
     }
-    body_text = st.text_area("Clustering request body (JSON)", value=json.dumps(example, indent=2), height=220)
+    return payload
 
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("Create clustering job", width="stretch"):
-            audit("button_clicked", widget="cluster_create")
+def parse_opt_routes(opt_result: dict) -> Dict[str, List[Tuple[float, float]]]:
+    """
+    Extract per-vehicle route geometry as list of coordinates, if available.
+    If not available, extract ordered job indices and reconstruct using locations list if present.
+    This function is defensive because response schema may vary by configuration.
+    """
+    routes: Dict[str, List[Tuple[float, float]]] = {}
+    # Try common structure: result -> routes list
+    res = opt_result.get("result") or opt_result
+    if isinstance(res, str):
+        try:
+            res = json.loads(res)
+        except Exception:
+            return routes
+
+    if isinstance(res, dict):
+        route_list = res.get("routes") or res.get("route") or res.get("solutions")
+        if isinstance(route_list, list):
+            for r in route_list:
+                vid = str(r.get("vehicle_id") or r.get("vehicle") or r.get("id") or "")
+                steps = r.get("steps") or r.get("activities") or r.get("stops")
+                coords: List[Tuple[float, float]] = []
+                if isinstance(steps, list):
+                    for s in steps:
+                        loc = s.get("location") or s.get("lat_lng") or s.get("coordinate")
+                        if isinstance(loc, (list, tuple)) and len(loc) == 2:
+                            coords.append((float(loc[0]), float(loc[1])))
+                        elif isinstance(loc, str) and "," in loc:
+                            a, b = loc.split(",", 1)
+                            coords.append((float(a), float(b)))
+                if vid:
+                    routes[vid] = coords
+    return routes
+
+def build_waypoint_string(coords: List[Tuple[float, float]]) -> str:
+    return "|".join([f"{lat},{lng}" for (lat, lng) in coords])
+
+def call_navigation_route(coords: List[Tuple[float, float]], routing_cfg: dict) -> dict:
+    """
+    Uses Navigation API (Fast) because it supports POST and large waypoint counts; docs recommend POST for >50 (up to 200). 
+    """
+    if len(coords) < 2:
+        return {"status": "Error", "message": "Need at least origin and destination."}
+
+    origin = f"{coords[0][0]},{coords[0][1]}"
+    destination = f"{coords[-1][0]},{coords[-1][1]}"
+    waypoints = coords[1:-1]
+    key = nb_key()
+    if not key:
+        raise RuntimeError("Missing NextBillion API key. Set NEXTBILLION_API_KEY or Streamlit secrets.")
+
+    params = {"key": key}
+    mode = routing_cfg.get("mode", "car")
+    avoid = routing_cfg.get("avoid", "").strip()
+    option = routing_cfg.get("option", "fast").strip().lower()
+
+    # Use /navigation/json for fast; flexible uses /navigation?option=flexible. We'll keep fast by default.
+    if option == "flexible":
+        url = f"{NB_BASE}/navigation"
+        params["option"] = "flexible"
+    else:
+        url = f"{NB_BASE}/navigation/json"
+
+    payload: Dict[str, Any] = {
+        "origin": origin,
+        "destination": destination,
+        "mode": mode,
+    }
+    if waypoints:
+        payload["waypoints"] = build_waypoint_string(waypoints)
+    if avoid:
+        payload["avoid"] = avoid
+
+    return http_post(url, payload=payload, params=params, timeout=120)
+
+def compute_kpis_from_nav(nav_json: dict) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Extract distance (meters) and duration (seconds) from Navigation/Directions-like response.
+    """
+    try:
+        routes = nav_json.get("routes", [])
+        if routes:
+            r0 = routes[0]
+            # Common keys in routing APIs
+            dist = r0.get("distance") or r0.get("distance_meters")
+            dur = r0.get("duration") or r0.get("duration_seconds")
+            if isinstance(dist, (int, float)) and isinstance(dur, (int, float)):
+                return float(dist), float(dur)
+    except Exception:
+        pass
+    return None, None
+
+def to_map(stops_df: pd.DataFrame, depots_df: pd.DataFrame, coords: List[Tuple[float, float]], title: str):
+    if folium is None or st_folium is None:
+        st.warning("Map libraries not installed. Install folium + streamlit-folium to view maps.")
+        return
+
+    if coords:
+        center = coords[0]
+    elif not depots_df.empty:
+        center = (float(depots_df.iloc[0]["lat"]), float(depots_df.iloc[0]["lng"]))
+    elif not stops_df.empty:
+        center = (float(stops_df.iloc[0]["lat"]), float(stops_df.iloc[0]["lng"]))
+    else:
+        center = (0.0, 0.0)
+
+    m = folium.Map(location=center, zoom_start=12, control_scale=True)
+    # Depots
+    for _, d in depots_df.iterrows():
+        folium.Marker(
+            (float(d["lat"]), float(d["lng"])),
+            tooltip=f"Depot {d.get('depot_id','')}",
+            icon=folium.Icon(color="blue", icon="home"),
+        ).add_to(m)
+
+    # Stops
+    for _, s in stops_df.iterrows():
+        folium.CircleMarker(
+            (float(s["lat"]), float(s["lng"])),
+            radius=4,
+            tooltip=str(s.get("stop_id","")),
+            fill=True,
+        ).add_to(m)
+
+    # Route polyline
+    if coords:
+        folium.PolyLine(coords, weight=4).add_to(m)
+
+    st.markdown(f"**{title}**")
+    st_folium(m, width="stretch", height=520)  # streamlit-folium supports width like this in recent versions
+
+
+# =========================
+# Sidebar controls
+# =========================
+
+def sidebar_controls():
+    ss = st.session_state
+    st.sidebar.header("Run Control Panel")
+
+    with st.sidebar.expander("Run identity", expanded=True):
+        ss.run_id = st.text_input("Run ID", value=ss.run_id)
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            ss.seed = st.number_input("Seed", value=int(ss.seed), step=1)
+        with c2:
+            if st.button("Random seed", use_container_width=True):
+                ss.seed = random.randint(1, 1_000_000)
+                log_event("INFO", "Seed randomized", seed=int(ss.seed))
+
+    with st.sidebar.expander("Planner mode", expanded=True):
+        ss.planner_mode = st.radio("Mode", ["Direct VRP", "Cluster-first"], index=0 if ss.planner_mode == "Direct VRP" else 1)
+        st.caption(f"Stops loaded: {len(ss.stops_df)} / {MAX_STOPS}")
+
+    with st.sidebar.expander("Objectives & routing", expanded=True):
+        ss.objective = st.selectbox("Optimization objective", ["duration", "distance"], index=0 if ss.objective == "duration" else 1)
+
+        # Driver & depot behavior
+        ss.driver_cfg["driver_count"] = int(st.number_input("Driver count", min_value=1, max_value=200, value=int(ss.driver_cfg["driver_count"]), step=1))
+        ss.driver_cfg["shift_start"] = st.text_input("Shift start (HH:MM)", value=ss.driver_cfg["shift_start"])
+        ss.driver_cfg["shift_end"] = st.text_input("Shift end (HH:MM)", value=ss.driver_cfg["shift_end"])
+        ss.driver_cfg["depot_mode"] = st.selectbox("Depot mode", ["single_depot", "multi_depot_random", "open_route"],
+                                                  index=["single_depot","multi_depot_random","open_route"].index(ss.driver_cfg["depot_mode"]))
+        ss.driver_cfg["route_type"] = st.selectbox("Route type", ["open", "round_trip"], index=0 if ss.driver_cfg["route_type"] == "open" else 1)
+
+        ss.routing_cfg["mode"] = st.selectbox("Directions/Navi mode", ["car", "truck"], index=0 if ss.routing_cfg["mode"] == "car" else 1)
+        ss.routing_cfg["option"] = st.selectbox("Navigation option", ["fast", "flexible"], index=0 if ss.routing_cfg["option"] == "fast" else 1)
+        ss.routing_cfg["avoid"] = st.text_input("Avoid (e.g., highway|toll)", value=ss.routing_cfg.get("avoid", ""))
+
+    with st.sidebar.expander("Actions", expanded=True):
+        if st.button("Validate Inputs", type="primary", use_container_width=True):
+            ok, errs = validate_inputs()
+            ss.validated = ok
+            if ok:
+                st.success("Validated ✅")
+                log_event("INFO", "Validation passed", stops=len(ss.stops_df), drivers=int(ss.driver_cfg["driver_count"]))
+            else:
+                st.error("Validation failed")
+                for e in errs:
+                    st.warning(e)
+                log_event("ERROR", "Validation failed", errors=errs)
+
+        if ss.planner_mode == "Cluster-first":
+            if st.button("Create Clustering Job", use_container_width=True, disabled=not ss.validated):
+                create_clustering_job()
+
+            if st.button("Fetch Clustering Result", use_container_width=True, disabled=not bool(ss.cluster_task_id)):
+                fetch_clustering_result()
+
+        if st.button("Create Optimization Job", use_container_width=True, disabled=not ss.validated):
+            create_optimization_job()
+
+        if st.button("Fetch Optimization Result", use_container_width=True, disabled=not bool(ss.opt_task_id)):
+            fetch_optimization_result()
+
+        if st.button("Build Baseline (Greedy + NN)", use_container_width=True, disabled=not ss.validated):
+            build_baseline()
+
+        if st.button("Run Directions for Optimized", use_container_width=True, disabled=not bool(ss.opt_result)):
+            run_directions_for_optimized()
+
+        if st.button("Run Directions for Baseline", use_container_width=True, disabled=not bool(ss.baseline_routes)):
+            run_directions_for_baseline()
+
+        if st.button("Export Run Pack", use_container_width=True):
+            export_run_pack()
+
+# =========================
+# Clustering: guided + editable payload
+# =========================
+
+def default_cluster_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, k: int, max_radius_km: float, max_jobs: int, routing_cfg: dict) -> dict:
+    """
+    Because the docs don't render the schema directly in HTML here,
+    we generate a best-effort payload and allow the user to tweak it before submission.
+    """
+    # Locations: depots then stops, similar to optimization pattern
+    locations: List[str] = []
+    if not depots_df.empty:
+        for _, r in depots_df.iterrows():
+            locations.append(f"{float(r['lat'])},{float(r['lng'])}")
+    stop_offset = len(locations)
+    for _, r in stops_df.iterrows():
+        locations.append(f"{float(r['lat'])},{float(r['lng'])}")
+
+    jobs = []
+    for idx, r in stops_df.reset_index(drop=True).iterrows():
+        jobs.append({
+            "id": int(idx + 1),
+            "location_index": stop_offset + idx,
+        })
+
+    payload: Dict[str, Any] = {
+        "description": f"Clusters_{k}_{now_iso()}",
+        "locations": locations,
+        "jobs": jobs,
+        "routing": {
+            "mode": routing_cfg.get("mode", "car"),
+            "option": routing_cfg.get("option", "fast"),
+        },
+        "k": int(k),
+    }
+    if max_radius_km > 0:
+        payload["max_cluster_radius"] = int(max_radius_km * 1000)  # meters (best-effort)
+    if max_jobs > 0:
+        payload["max_jobs_in_cluster"] = int(max_jobs)
+    return payload
+
+def create_clustering_job():
+    ss = st.session_state
+    key = nb_key()
+    if not key:
+        st.error("Missing NextBillion API key. Set NEXTBILLION_API_KEY (or Streamlit secrets).")
+        return
+
+    # Pull guided settings from session (stored in ss.cluster_ui dict if set)
+    cluster_ui = ss.get("cluster_ui", {})
+    k = int(cluster_ui.get("k", ss.driver_cfg["driver_count"]))
+    max_radius_km = float(cluster_ui.get("max_radius_km", 0))
+    max_jobs = int(cluster_ui.get("max_jobs", 0))
+
+    payload = default_cluster_payload(ss.stops_df, ss.depots_df, k, max_radius_km, max_jobs, ss.routing_cfg)
+    ss.cluster_create_payload = payload
+
+    url = f"{NB_BASE}/clustering"
+    params = {"key": key}
+    try:
+        resp = http_post(url, payload=payload, params=params, timeout=120)
+        ss.cluster_task_id = resp.get("id", "") or resp.get("request_id", "")
+        st.success(f"Clustering job created: {ss.cluster_task_id}")
+        log_event("INFO", "Clustering job created", cluster_id=ss.cluster_task_id)
+    except Exception as e:
+        st.exception(e)
+
+def fetch_clustering_result():
+    ss = st.session_state
+    key = nb_key()
+    if not key:
+        st.error("Missing NextBillion API key. Set NEXTBILLION_API_KEY (or Streamlit secrets).")
+        return
+    if not ss.cluster_task_id:
+        st.warning("No clustering task ID.")
+        return
+
+    url = f"{NB_BASE}/clustering/result"
+    params = {"id": ss.cluster_task_id, "key": key}
+    try:
+        resp = http_get(url, params=params, timeout=120)
+        ss.cluster_result = resp
+        st.success("Clustering result fetched.")
+        log_event("INFO", "Clustering result fetched", cluster_id=ss.cluster_task_id)
+    except Exception as e:
+        st.exception(e)
+
+# =========================
+# Optimization
+# =========================
+
+def create_optimization_job():
+    ss = st.session_state
+    key = nb_key()
+    if not key:
+        st.error("Missing NextBillion API key. Set NEXTBILLION_API_KEY (or Streamlit secrets).")
+        return
+
+    payload = build_opt_payload(ss.stops_df, ss.depots_df, ss.driver_cfg, ss.objective, int(ss.seed))
+    ss.opt_create_payload = payload
+
+    url = f"{NB_BASE}/optimization/v2"
+    params = {"key": key}
+    try:
+        resp = http_post(url, payload=payload, params=params, timeout=120)
+        ss.opt_task_id = resp.get("id", "") or resp.get("request_id", "")
+        st.success(f"Optimization job created: {ss.opt_task_id}")
+        log_event("INFO", "Optimization job created", opt_id=ss.opt_task_id)
+    except Exception as e:
+        st.exception(e)
+
+def fetch_optimization_result():
+    ss = st.session_state
+    key = nb_key()
+    if not key:
+        st.error("Missing NextBillion API key. Set NEXTBILLION_API_KEY (or Streamlit secrets).")
+        return
+    if not ss.opt_task_id:
+        st.warning("No optimization task ID.")
+        return
+
+    url = f"{NB_BASE}/optimization/v2/result"
+    params = {"id": ss.opt_task_id, "key": key}
+    try:
+        resp = http_get(url, params=params, timeout=180)
+        ss.opt_result = resp
+        st.success("Optimization result fetched.")
+        log_event("INFO", "Optimization result fetched", opt_id=ss.opt_task_id)
+    except Exception as e:
+        st.exception(e)
+
+# =========================
+# Baseline
+# =========================
+
+def build_baseline():
+    ss = st.session_state
+    starts = assign_depots_to_vehicles(ss.depots_df, int(ss.driver_cfg["driver_count"]), ss.driver_cfg["depot_mode"], int(ss.seed))
+    routes = build_baseline_routes(ss.stops_df, starts, int(ss.seed))
+    ss.baseline_routes = routes
+    # For transparency, keep assignment too
+    ss.baseline_assignment = greedy_assign_stops_to_vehicles(ss.stops_df, starts, int(ss.seed))
+    st.success("Baseline built (Greedy assignment + nearest-neighbor sequencing).")
+    log_event("INFO", "Baseline built", vehicles=len(routes))
+
+# =========================
+# Directions/Navigation per route
+# =========================
+
+def route_coords_for_vehicle(vehicle_id: str, ordered_stop_ids: List[str], starts: Optional[Tuple[float, float]], route_type: str) -> List[Tuple[float, float]]:
+    pts = {str(r["stop_id"]): (float(r["lat"]), float(r["lng"])) for _, r in st.session_state.stops_df.iterrows()}
+    coords: List[Tuple[float, float]] = []
+    if starts is not None:
+        coords.append(starts)
+    coords.extend([pts[sid] for sid in ordered_stop_ids if sid in pts])
+    if route_type == "round_trip" and starts is not None:
+        coords.append(starts)
+    return coords
+
+def run_directions_for_baseline():
+    ss = st.session_state
+    starts = assign_depots_to_vehicles(ss.depots_df, int(ss.driver_cfg["driver_count"]), ss.driver_cfg["depot_mode"], int(ss.seed))
+    out = {}
+    for i in range(int(ss.driver_cfg["driver_count"])):
+        vid = f"V{i+1}"
+        route = ss.baseline_routes.get(vid, [])
+        coords = route_coords_for_vehicle(vid, route, starts[i], ss.driver_cfg["route_type"])
+        if len(coords) < 2:
+            continue
+        try:
+            nav = call_navigation_route(coords, ss.routing_cfg)
+            out[vid] = nav
+        except Exception as e:
+            out[vid] = {"status": "Error", "message": str(e)}
+    ss.dir_baseline = out
+    st.success("Directions/Navigation computed for baseline routes.")
+    log_event("INFO", "Baseline navigation done", vehicles=len(out))
+
+def run_directions_for_optimized():
+    """
+    Defensive approach: if the optimizer result contains explicit waypoint coordinates per vehicle, use them.
+    Otherwise, we try to reconstruct ordered job location indices from the response if present.
+    """
+    ss = st.session_state
+    if not ss.opt_result:
+        st.warning("No optimization result.")
+        return
+    out = {}
+
+    # Best-effort parse: we look for route steps that contain location indices, then map to payload locations.
+    payload_locations = ss.opt_create_payload.get("locations", [])
+    loc_coords: List[Tuple[float, float]] = []
+    for s in payload_locations:
+        try:
+            a, b = str(s).split(",", 1)
+            loc_coords.append((float(a), float(b)))
+        except Exception:
+            loc_coords.append((0.0, 0.0))
+
+    res = ss.opt_result.get("result") or ss.opt_result
+    if isinstance(res, str):
+        try:
+            res = json.loads(res)
+        except Exception:
+            res = {}
+
+    routes = []
+    if isinstance(res, dict) and isinstance(res.get("routes"), list):
+        routes = res["routes"]
+    elif isinstance(res, dict) and isinstance(res.get("solutions"), list):
+        routes = res["solutions"]
+
+    for r in routes:
+        vid = str(r.get("vehicle_id") or r.get("vehicle") or r.get("id") or "")
+        steps = r.get("steps") or r.get("activities") or r.get("stops") or []
+        coords: List[Tuple[float, float]] = []
+        for s in steps:
+            # Prefer explicit coordinates
+            loc = s.get("location")
+            if isinstance(loc, (list, tuple)) and len(loc) == 2:
+                coords.append((float(loc[0]), float(loc[1])))
+                continue
+            if isinstance(loc, str) and "," in loc:
+                a, b = loc.split(",", 1)
+                coords.append((float(a), float(b)))
+                continue
+            # Try location_index
+            li = s.get("location_index")
+            if isinstance(li, int) and 0 <= li < len(loc_coords):
+                coords.append(loc_coords[li])
+
+        if len(coords) >= 2 and vid:
             try:
-                payload = json.loads(body_text)
-                st.session_state.last_cluster_payload = payload
-                res = nb_cluster_create(payload)
-                st.session_state.last_cluster_create_json = res
-                st.session_state.last_cluster_task_id = res.get("id")
-                st.success(f"Clustering job created: {st.session_state.last_cluster_task_id}")
-                st.json(res)
+                nav = call_navigation_route(coords, ss.routing_cfg)
+                out[vid] = nav
             except Exception as e:
-                audit("error", where="cluster_create", msg=str(e), level="ERROR")
-                st.error(str(e))
+                out[vid] = {"status": "Error", "message": str(e)}
 
-    with colB:
-        if st.button("Fetch clustering result", width="stretch"):
-            audit("button_clicked", widget="cluster_result")
-            try:
-                cid = st.session_state.get("last_cluster_task_id")
-                if not cid:
-                    st.error("No clustering job id yet.")
-                else:
-                    res = nb_cluster_result(cid)
-                    st.session_state.last_cluster_result_json = res
-                    st.json(res)
-            except Exception as e:
-                audit("error", where="cluster_result", msg=str(e), level="ERROR")
-                st.error(str(e))
+    ss.dir_optimized = out
+    st.success("Directions/Navigation computed for optimized routes (best-effort).")
+    log_event("INFO", "Optimized navigation done", vehicles=len(out))
 
-    if st.session_state.get("last_cluster_result_json"):
-        st.download_button(
-            "Download last Clustering Result JSON",
-            data=json.dumps(st.session_state.last_cluster_result_json, ensure_ascii=False),
-            file_name="clustering_result_last.json",
-            mime="application/json",
-            width="content",
-        )
+# =========================
+# Export
+# =========================
 
-# -------------------------
-# Logs tab
-# -------------------------
-with tabs[5]:
-    st.subheader("Session logs")
-    st.caption("These are session-scoped logs. Backend logs are also visible in Streamlit Community Cloud → Manage app → Cloud logs.")
-    last_n = st.number_input("Show last N events", min_value=10, max_value=600, value=80, step=10)
-    events = st.session_state.get("audit_events", [])[-int(last_n):]
-    st.code("\n".join(json.dumps(e, ensure_ascii=False) for e in events), language="json")
+def export_run_pack():
+    ss = st.session_state
+    pack = {
+        "run_id": ss.run_id,
+        "seed": int(ss.seed),
+        "planner_mode": ss.planner_mode,
+        "objective": ss.objective,
+        "driver_cfg": ss.driver_cfg,
+        "routing_cfg": ss.routing_cfg,
+        "created_at": now_iso(),
+        "stops": ss.stops_df.to_dict("records"),
+        "depots": ss.depots_df.to_dict("records"),
+        "cluster_task_id": ss.cluster_task_id,
+        "cluster_create_payload": ss.cluster_create_payload,
+        "cluster_result": ss.cluster_result,
+        "opt_task_id": ss.opt_task_id,
+        "opt_create_payload": ss.opt_create_payload,
+        "opt_result": ss.opt_result,
+        "baseline_assignment": ss.baseline_assignment,
+        "baseline_routes": ss.baseline_routes,
+        "dir_baseline": ss.dir_baseline,
+        "dir_optimized": ss.dir_optimized,
+        "logs": ss.log_rows[-500:],  # last 500
+    }
+    data = safe_json_dumps(pack).encode("utf-8")
     st.download_button(
-        "Download session logs (JSONL)",
-        data="\n".join(json.dumps(e, ensure_ascii=False) for e in st.session_state.get("audit_events", [])),
-        file_name=f"audit_{st.session_state.get('run_id','')}.jsonl",
+        "Download Run Pack (JSON)",
+        data=data,
+        file_name=f"{ss.run_id}_run_pack.json",
         mime="application/json",
         width="content",
     )
+    log_event("INFO", "Run pack prepared", bytes=len(data))
+
+# =========================
+# Pages
+# =========================
+
+def page_stops():
+    ss = st.session_state
+    st.subheader("Stops")
+
+    with st.expander("Generate stops (seeded)", expanded=True):
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+        with c1:
+            n = st.number_input("Stop count", min_value=1, max_value=MAX_STOPS, value=min(50, MAX_STOPS), step=1)
+        with c2:
+            preset = st.selectbox("Preset", ["Dense", "3 pockets", "Mixed", "Long tail"])
+        with c3:
+            jitter_m = st.number_input("Jitter (meters)", min_value=50, max_value=5000, value=800, step=50)
+        with c4:
+            tw_pct = st.slider("% with time windows", min_value=0, max_value=100, value=40, step=5)
+
+        c5, c6 = st.columns([1, 1])
+        with c5:
+            tw_preset = st.selectbox("Time window preset", ["Loose", "Waves", "Tight"])
+        with c6:
+            center_lat = st.number_input("Center lat", value=float(ss.depots_df.iloc[0]["lat"]) if not ss.depots_df.empty else 0.0, format="%.6f")
+            center_lng = st.number_input("Center lng", value=float(ss.depots_df.iloc[0]["lng"]) if not ss.depots_df.empty else 0.0, format="%.6f")
+
+        if st.button("Generate & replace stops", width="stretch"):
+            df = generate_stops(int(ss.seed), int(n), preset, (float(center_lat), float(center_lng)), int(jitter_m), int(tw_pct), tw_preset)
+            ss.stops_df = df
+            ss.validated = False
+            ss.baseline_routes = {}
+            ss.opt_task_id = ""
+            ss.opt_result = {}
+            ss.dir_baseline = {}
+            ss.dir_optimized = {}
+            st.success(f"Generated {len(df)} stops.")
+            log_event("INFO", "Stops generated", count=len(df), preset=preset)
+
+    st.caption("Edit stops below. Required: stop_id, lat, lng. Optional: tw_start/tw_end (HH:MM).")
+    ss.stops_df = st.data_editor(
+        ss.stops_df,
+        num_rows="dynamic",
+        width="stretch",
+        key="stops_editor",
+    )
+
+    with st.expander("Import stops CSV", expanded=False):
+        up = st.file_uploader("Upload CSV", type=["csv"])
+        if up:
+            try:
+                df = pd.read_csv(up)
+                # Normalize columns
+                col_map = {c.lower(): c for c in df.columns}
+                # Accept common variants
+                def pick(*names):
+                    for n in names:
+                        if n in col_map:
+                            return col_map[n]
+                    return None
+
+                stop_id_col = pick("stop_id", "id", "stopid")
+                lat_col = pick("lat", "latitude")
+                lng_col = pick("lng", "lon", "longitude")
+                addr_col = pick("address")
+                tws_col = pick("tw_start", "time_window_start", "window_start")
+                twe_col = pick("tw_end", "time_window_end", "window_end")
+
+                out = pd.DataFrame()
+                out["stop_id"] = df[stop_id_col] if stop_id_col else [f"S{i+1}" for i in range(len(df))]
+                out["address"] = df[addr_col] if addr_col else ""
+                out["lat"] = df[lat_col] if lat_col else None
+                out["lng"] = df[lng_col] if lng_col else None
+                out["tw_start"] = df[tws_col] if tws_col else ""
+                out["tw_end"] = df[twe_col] if twe_col else ""
+                ss.stops_df = out
+                ss.validated = False
+                st.success(f"Imported {len(out)} stops.")
+                log_event("INFO", "Stops imported", count=len(out))
+            except Exception as e:
+                st.exception(e)
+
+def page_drivers_depots():
+    ss = st.session_state
+    st.subheader("Drivers & Depots")
+
+    st.markdown("### Depots")
+    ss.depots_df = st.data_editor(
+        ss.depots_df,
+        num_rows="dynamic",
+        width="stretch",
+        key="depots_editor",
+    )
+
+    st.markdown("### Driver settings")
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    with c1:
+        ss.driver_cfg["driver_count"] = int(st.number_input("Driver count", min_value=1, max_value=200, value=int(ss.driver_cfg["driver_count"]), step=1, key="driver_count_main"))
+    with c2:
+        ss.driver_cfg["shift_start"] = st.text_input("Shift start (HH:MM)", value=ss.driver_cfg["shift_start"], key="shift_start_main")
+    with c3:
+        ss.driver_cfg["shift_end"] = st.text_input("Shift end (HH:MM)", value=ss.driver_cfg["shift_end"], key="shift_end_main")
+    with c4:
+        ss.driver_cfg["depot_mode"] = st.selectbox("Depot mode", ["single_depot", "multi_depot_random", "open_route"],
+                                                  index=["single_depot","multi_depot_random","open_route"].index(ss.driver_cfg["depot_mode"]),
+                                                  key="depot_mode_main")
+
+    ss.driver_cfg["route_type"] = st.selectbox("Route type", ["open", "round_trip"], index=0 if ss.driver_cfg["route_type"] == "open" else 1, key="route_type_main")
+
+    st.info("Tip: For round trips, vehicles return to their start depot. For open routes, vehicles end at the last stop.")
+
+def page_clustering():
+    ss = st.session_state
+    st.subheader("Clustering (guided)")
+
+    if ss.planner_mode != "Cluster-first":
+        st.warning("Switch Planner Mode to 'Cluster-first' in the sidebar to use clustering.")
+        return
+
+    st.markdown("### Clustering settings")
+    if "cluster_ui" not in ss:
+        ss.cluster_ui = {"k": int(ss.driver_cfg["driver_count"]), "max_radius_km": 0.0, "max_jobs": 0}
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        ss.cluster_ui["k"] = int(st.number_input("k clusters", min_value=1, max_value=200, value=int(ss.cluster_ui["k"]), step=1))
+    with c2:
+        ss.cluster_ui["max_radius_km"] = float(st.number_input("Max cluster radius (km) [optional]", min_value=0.0, max_value=200.0, value=float(ss.cluster_ui["max_radius_km"]), step=1.0))
+    with c3:
+        ss.cluster_ui["max_jobs"] = int(st.number_input("Max jobs per cluster [optional]", min_value=0, max_value=MAX_STOPS, value=int(ss.cluster_ui["max_jobs"]), step=1))
+
+    st.markdown("### Generated clustering payload (editable)")
+    payload = default_cluster_payload(ss.stops_df, ss.depots_df, int(ss.cluster_ui["k"]), float(ss.cluster_ui["max_radius_km"]), int(ss.cluster_ui["max_jobs"]), ss.routing_cfg)
+    txt = st.text_area("Clustering JSON", value=safe_json_dumps(payload), height=260)
+    try:
+        edited = json.loads(txt)
+        ss.cluster_create_payload = edited
+        st.success("Clustering payload JSON is valid.")
+    except Exception as e:
+        st.error(f"Invalid JSON: {e}")
+        return
+
+    c4, c5 = st.columns([1, 1])
+    with c4:
+        if st.button("Create clustering job (using edited payload)", width="stretch", disabled=not ss.validated):
+            key = nb_key()
+            if not key:
+                st.error("Missing API key.")
+            else:
+                url = f"{NB_BASE}/clustering"
+                params = {"key": key}
+                try:
+                    resp = http_post(url, payload=ss.cluster_create_payload, params=params, timeout=120)
+                    ss.cluster_task_id = resp.get("id", "") or resp.get("request_id", "")
+                    st.success(f"Clustering job created: {ss.cluster_task_id}")
+                except Exception as ex:
+                    st.exception(ex)
+    with c5:
+        if st.button("Fetch clustering result", width="stretch", disabled=not bool(ss.cluster_task_id)):
+            fetch_clustering_result()
+
+    if ss.cluster_result:
+        st.markdown("### Clustering result (raw)")
+        st.code(safe_json_dumps(ss.cluster_result), language="json")
+
+def page_optimization():
+    ss = st.session_state
+    st.subheader("Optimization")
+
+    st.markdown("### Optimization payload (generated)")
+    payload = build_opt_payload(ss.stops_df, ss.depots_df, ss.driver_cfg, ss.objective, int(ss.seed))
+    st.code(safe_json_dumps(payload), language="json")
+    ss.opt_create_payload = payload
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("Create optimization job", width="stretch", disabled=not ss.validated):
+            create_optimization_job()
+    with c2:
+        if st.button("Fetch optimization result", width="stretch", disabled=not bool(ss.opt_task_id)):
+            fetch_optimization_result()
+
+    if ss.opt_task_id:
+        st.info(f"Current Optimization Task ID: {ss.opt_task_id}")
+
+    if ss.opt_result:
+        st.markdown("### Optimization result (raw)")
+        st.code(safe_json_dumps(ss.opt_result)[:8000], language="json")
+
+def compute_totals_from_dir(dir_by_vehicle: Dict[str, dict]) -> Tuple[float, float]:
+    total_dist = 0.0
+    total_dur = 0.0
+    for _, j in dir_by_vehicle.items():
+        dist, dur = compute_kpis_from_nav(j)
+        if dist is not None:
+            total_dist += dist
+        if dur is not None:
+            total_dur += dur
+    return total_dist, total_dur
+
+def page_review_export():
+    ss = st.session_state
+    st.subheader("Review & Export")
+
+    # SUMMARY FIRST
+    st.markdown("## Summary (Baseline vs Optimized)")
+
+    b_dist, b_dur = compute_totals_from_dir(ss.dir_baseline) if ss.dir_baseline else (0.0, 0.0)
+    o_dist, o_dur = compute_totals_from_dir(ss.dir_optimized) if ss.dir_optimized else (0.0, 0.0)
+
+    def pct(a, b):
+        if a == 0:
+            return None
+        return (b - a) / a * 100.0
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Baseline distance (m)", f"{b_dist:,.0f}")
+    col2.metric("Optimized distance (m)", f"{o_dist:,.0f}", delta=f"{(pct(b_dist, o_dist) or 0):.2f}%" if b_dist else None)
+    col3.metric("Baseline duration (s)", f"{b_dur:,.0f}")
+    col4.metric("Optimized duration (s)", f"{o_dur:,.0f}", delta=f"{(pct(b_dur, o_dur) or 0):.2f}%" if b_dur else None)
+
+    st.caption("Note: Distances/durations come from Navigation API validation. If you haven't run Directions yet, these will be 0.")
+
+    st.markdown("## Maps (select a vehicle)")
+    vids = sorted(set(list(ss.dir_baseline.keys()) + list(ss.dir_optimized.keys())))
+    if not vids:
+        st.info("Run Directions for baseline and/or optimized routes to view maps.")
+        return
+
+    vid = st.selectbox("Vehicle", vids)
+    show = st.radio("Show", ["Optimized", "Baseline"], horizontal=True)
+    data = ss.dir_optimized.get(vid) if show == "Optimized" else ss.dir_baseline.get(vid)
+
+    # Try to extract polyline points if present; otherwise plot stops only
+    coords: List[Tuple[float, float]] = []
+    try:
+        routes = data.get("routes", [])
+        if routes:
+            geom = routes[0].get("geometry") or routes[0].get("overview_polyline")
+            # We won't decode polyline here to keep dependencies low.
+            # We'll just show stops + depot; route polyline requires decode libs.
+    except Exception:
+        pass
+
+    # If no polyline decode, show points in order (origin->...->destination) from request if possible.
+    # This is why we store routes in baseline/opt payloads; for baseline we can reconstruct.
+    if show == "Baseline" and ss.baseline_routes:
+        starts = assign_depots_to_vehicles(ss.depots_df, int(ss.driver_cfg["driver_count"]), ss.driver_cfg["depot_mode"], int(ss.seed))
+        idx = int(vid.replace("V", "")) - 1
+        route = ss.baseline_routes.get(vid, [])
+        coords = route_coords_for_vehicle(vid, route, starts[idx] if 0 <= idx < len(starts) else None, ss.driver_cfg["route_type"])
+
+    if folium is not None and st_folium is not None:
+        to_map(ss.stops_df, ss.depots_df, coords, title=f"{show} route: {vid}")
+    else:
+        st.json(data)
+
+    st.markdown("## Export")
+    export_run_pack()
+
+def page_logs():
+    ss = st.session_state
+    st.subheader("Logs")
+
+    df = pd.DataFrame(ss.log_rows)
+    if df.empty:
+        st.info("No logs yet.")
+        return
+    st.dataframe(df.tail(200), width="stretch", height=400)
+
+    st.download_button(
+        "Download logs (jsonl)",
+        data="\n".join(json.dumps(r, ensure_ascii=False) for r in ss.log_rows).encode("utf-8"),
+        file_name=f"{ss.run_id}_logs.jsonl",
+        mime="application/json",
+        width="content",
+    )
+
+# =========================
+# Main
+# =========================
+
+def main():
+    init_state()
+    sidebar_controls()
+
+    st.title("NextBillion Routing Testbench (200-stop QA)")
+    next_step_banner()
+
+    tabs = st.tabs(["Stops", "Drivers & Depots", "Clustering", "Optimization", "Review & Export", "Logs"])
+
+    with tabs[0]:
+        page_stops()
+    with tabs[1]:
+        page_drivers_depots()
+    with tabs[2]:
+        page_clustering()
+    with tabs[3]:
+        page_optimization()
+    with tabs[4]:
+        page_review_export()
+    with tabs[5]:
+        page_logs()
+
+if __name__ == "__main__":
+    main()
