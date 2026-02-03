@@ -632,7 +632,7 @@ with tabs[0]:
 
         st.markdown("### Stops table (editable)")
         df = pd.DataFrame(st.session_state.stops)
-        edited = st.data_editor(df, num_rows="dynamic", width="stretch", key="stops_editor"
+        edited = st.data_editor(df, num_rows="dynamic", width="stretch", key="stops_editor")
         st.session_state.stops = edited.to_dict(orient="records")
 
         st.markdown("### Stops map (red numbered pins)")
