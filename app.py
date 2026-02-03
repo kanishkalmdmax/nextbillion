@@ -23,6 +23,15 @@ import pandas as pd
 import requests
 import streamlit as st
 
+import warnings
+
+# Silence noisy pandas FutureWarning triggered internally by st.data_editor when adding empty/all-NA rows.
+warnings.filterwarnings(
+    "ignore",
+    message=r"The behavior of DataFrame concatenation with empty or all-NA entries is deprecated.*",
+    category=FutureWarning,
+)
+
 # Optional map components
 try:
     import folium
@@ -187,21 +196,32 @@ def http_get(url: str, params: Optional[dict] = None, timeout: int = 60) -> dict
 
 def http_post(url: str, payload: dict, params: Optional[dict] = None, timeout: int = 120) -> dict:
     t0 = time.time()
+    r = None
     try:
         r = requests.post(url, params=params, json=payload, timeout=timeout)
         dt = round((time.time() - t0) * 1000)
         log_event("INFO", "POST", url=url, status=r.status_code, ms=dt)
-        r.raise_for_status()
+
+        # If the API returns a structured error, surface it in logs/UI.
+        if r.status_code >= 400:
+            body = (r.text or "")[:5000]
+            log_event("ERROR", "POST failed", url=url, status=r.status_code, ms=dt, body=body)
+            raise RuntimeError(f"HTTP {r.status_code} from {url}: {body}")
+
         return r.json()
     except requests.RequestException as e:
         dt = round((time.time() - t0) * 1000)
         body = ""
+        status = None
         try:
-            body = r.text[:2000]
+            if r is not None:
+                status = r.status_code
+                body = (r.text or "")[:5000]
         except Exception:
             pass
-        log_event("ERROR", "POST failed", url=url, ms=dt, error=str(e), body=body)
+        log_event("ERROR", "POST exception", url=url, status=status, ms=dt, error=str(e), body=body)
         raise
+
 
 def next_step_banner():
     ss = st.session_state
@@ -482,7 +502,7 @@ def build_opt_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, cfg: dict
       GET  https://api.nextbillion.io/optimization/v2/result?id=...&key=...
 
     Key rules from docs:
-      - `locations` must be an object containing a `location` list (strings "lat,lng"); `start_index`/`end_index` refer to indices in that list.
+      - `locations` is an ordered list of coordinate strings ("lat,lng"); `start_index`/`end_index` refer to indices in that list.
       - Every vehicle must have a start location configured (via `start_index` or a depot workflow).
       - For round trip: set `start_index` == `end_index`.
     """
@@ -571,7 +591,7 @@ def build_opt_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, cfg: dict
 
     options: Dict[str, Any] = {"objective": {"travel_cost": objective}}
     payload = {
-        "locations": {"id": 1, "location": locations},
+        "locations": locations,
         "jobs": jobs,
         "vehicles": vehicles,
         "options": options,
@@ -812,7 +832,7 @@ def default_cluster_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, k: 
 
     payload: Dict[str, Any] = {
         "description": f"Clusters_{k}_{now_iso()}",
-        "locations": {"id": 1, "location": locations},
+        "locations": locations,
         "jobs": jobs,
         "routing": {
             "mode": routing_cfg.get("mode", "car"),
