@@ -32,6 +32,11 @@ st.set_page_config(page_title="NextBillion.ai — Visual API Tester", layout="wi
 # =========================
 # AUDIT / DEBUG LOGGING
 # =========================
+
+# We log to:
+# 1) Console (visible in Streamlit Community Cloud → Manage app → Cloud logs)
+# 2) In-app sidebar panel (session-only)
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -61,7 +66,7 @@ def _safe_preview(v, max_len: int = 180):
         return str(v)[:max_len]
 
 
-def init_audit():
+def init_audit_logger():
     if "audit_events" not in st.session_state:
         st.session_state.audit_events = []
     if "run_id" not in st.session_state:
@@ -69,7 +74,7 @@ def init_audit():
 
     logger = logging.getLogger("nextbillion_audit")
     if not logger.handlers:
-        h = logging.StreamHandler()  # goes to console => Streamlit Cloud logs
+        h = logging.StreamHandler()
         fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
         h.setFormatter(fmt)
         logger.addHandler(h)
@@ -78,15 +83,22 @@ def init_audit():
     return logger
 
 
-AUDIT_LOG = init_audit()
+AUDIT_LOG = init_audit_logger()
 
 
 def audit_event(event: str, **fields):
-    payload = {"ts": _utc_now_iso(), "run_id": st.session_state.get("run_id", ""), "event": event}
+    payload = {
+        "ts": _utc_now_iso(),
+        "run_id": st.session_state.get("run_id", ""),
+        "event": event,
+    }
     for k, v in fields.items():
         payload[k] = _safe_preview(v)
-    msg = json.dumps(payload, ensure_ascii=False)
-    AUDIT_LOG.info(msg)
+
+    # Console logs (Cloud logs)
+    AUDIT_LOG.info(json.dumps(payload, ensure_ascii=False))
+
+    # In-app session log
     st.session_state.audit_events.append(payload)
     if len(st.session_state.audit_events) > 2500:
         st.session_state.audit_events = st.session_state.audit_events[-2500:]
@@ -96,10 +108,11 @@ def audit_session_state_changes():
     """Diff session_state between runs to catch widget changes without wiring every widget."""
     deny = {
         "audit_events", "run_id", "audit_prev_snapshot",
-        # noisy / large payload buckets
+        # large payload buckets (avoid noisy diffs)
         "last_geocode_json", "last_places_json", "last_directions_json", "last_optimize_json",
         "region_results", "places_results",
     }
+
     prev = st.session_state.get("audit_prev_snapshot")
     if prev is None:
         st.session_state.audit_prev_snapshot = {k: _safe_preview(st.session_state.get(k)) for k in st.session_state.keys()}
@@ -108,20 +121,22 @@ def audit_session_state_changes():
     cur = {k: _safe_preview(st.session_state.get(k)) for k in st.session_state.keys() if k not in deny}
     prev_f = {k: v for k, v in prev.items() if k not in deny}
 
-    # Find changes
     changed = []
     for k, v in cur.items():
         if k not in prev_f or prev_f[k] != v:
             changed.append((k, prev_f.get(k), v))
 
-    for k, old, new in changed[:120]:  # cap per rerun
+    for k, old, new in changed[:120]:
         audit_event("state_change", key=k, old=old, new=new)
 
     st.session_state.audit_prev_snapshot = {k: _safe_preview(st.session_state.get(k)) for k in st.session_state.keys()}
 
 
+# IMPORTANT: prevent recursion by calling the original Streamlit button
+_ST_BUTTON = st.button
+
 def audit_button(label: str, *args, **kwargs) -> bool:
-    clicked = audit_button(label, *args, **kwargs)
+    clicked = _ST_BUTTON(label, *args, **kwargs)
     if clicked:
         audit_event("button_clicked", label=label, key=kwargs.get("key"))
     return clicked
@@ -143,6 +158,7 @@ def render_audit_panel():
 
 # Capture widget/state changes on each rerun (best-effort)
 audit_session_state_changes()
+
 
 
 
@@ -195,7 +211,24 @@ def safe_get(d: Dict, path: List, default=None):
 
 def nb_get(path: str, params: Dict, timeout: int = 60) -> Tuple[int, Dict]:
     url = f"{NB_BASE}{path}"
-    r = requests.get(url, params=params, headers=UA, timeout=timeout)
+
+    # mask API key in logs
+    p = dict(params or {})
+    if "key" in p:
+        p["key"] = _mask_secret(p.get("key"))
+
+    t0 = time.time()
+    audit_event("api_get_start", path=path, params=p, timeout=timeout)
+
+    try:
+        r = requests.get(url, params=params, headers=UA, timeout=timeout)
+    except Exception as e:
+        audit_event("api_get_error", path=path, params=p, error=str(e))
+        return 0, {"error": str(e)}
+
+    ms = int((time.time() - t0) * 1000)
+    audit_event("api_get_end", path=path, status=r.status_code, ms=ms, bytes=len(r.text) if r.text else 0)
+
     try:
         return r.status_code, r.json()
     except Exception:
@@ -204,12 +237,28 @@ def nb_get(path: str, params: Dict, timeout: int = 60) -> Tuple[int, Dict]:
 
 def nb_post(path: str, params: Dict, body: Dict, timeout: int = 60) -> Tuple[int, Dict]:
     url = f"{NB_BASE}{path}"
-    r = requests.post(url, params=params, json=body, headers=UA, timeout=timeout)
+
+    # mask API key in logs
+    p = dict(params or {})
+    if "key" in p:
+        p["key"] = _mask_secret(p.get("key"))
+
+    t0 = time.time()
+    audit_event("api_post_start", path=path, params=p, body=_safe_preview(body), timeout=timeout)
+
+    try:
+        r = requests.post(url, params=params, json=body, headers=UA, timeout=timeout)
+    except Exception as e:
+        audit_event("api_post_error", path=path, params=p, error=str(e))
+        return 0, {"error": str(e)}
+
+    ms = int((time.time() - t0) * 1000)
+    audit_event("api_post_end", path=path, status=r.status_code, ms=ms, bytes=len(r.text) if r.text else 0)
+
     try:
         return r.status_code, r.json()
     except Exception:
         return r.status_code, {"raw": r.text}
-
 
 def latlng_str(lat: float, lng: float) -> str:
     return f"{lat:.6f},{lng:.6f}"
@@ -423,7 +472,6 @@ def ensure_state():
 
 
 ensure_state()
-render_audit_panel()
 
 
 # =========================
@@ -525,6 +573,7 @@ def vrp_result_no_cache(api_key: str, job_id: str) -> Tuple[int, Dict]:
 # UI — SIDEBAR GLOBAL OPTIONS
 # =========================
 st.sidebar.title("Config")
+render_audit_panel()
 
 st.session_state.api_key = st.sidebar.text_input(
     "NextBillion API Key",
