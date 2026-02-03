@@ -18,7 +18,7 @@ from streamlit_folium import st_folium
 # =========================
 # CONFIG
 # =========================
-DEFAULT_API_KEY = "a08a2b15af0f432c8e438403bc2b00e3"  # embedded as requested
+DEFAULT_API_KEY = st.secrets.get("NEXTBILLION_API_KEY", os.getenv("NEXTBILLION_API_KEY", ""))
 NB_BASE = "https://api.nextbillion.io"
 UA = {"User-Agent": "NextBillion-Visual-Tester/1.0"}
 
@@ -1243,3 +1243,4 @@ with tabs[5]:
             pass
 
         st_folium(m, height=520, use_container_width=True, key=f"iso_map_v{st.session_state.map_version}")
+
