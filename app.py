@@ -26,6 +26,7 @@ import streamlit as st
 # Optional map components
 try:
     import folium
+    from folium.plugins import PolyLineTextPath
     from streamlit_folium import st_folium
 except Exception:
     folium = None
@@ -481,7 +482,7 @@ def build_opt_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, cfg: dict
       GET  https://api.nextbillion.io/optimization/v2/result?id=...&key=...
 
     Key rules from docs:
-      - `locations` is an array of "lat,lng" strings, and `start_index`/`end_index` refer to indices in that array.
+      - `locations` must be an object containing a `location` list (strings "lat,lng"); `start_index`/`end_index` refer to indices in that list.
       - Every vehicle must have a start location configured (via `start_index` or a depot workflow).
       - For round trip: set `start_index` == `end_index`.
     """
@@ -570,7 +571,7 @@ def build_opt_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, cfg: dict
 
     options: Dict[str, Any] = {"objective": {"travel_cost": objective}}
     payload = {
-        "locations": locations,
+        "locations": {"id": 1, "location": locations},
         "jobs": jobs,
         "vehicles": vehicles,
         "options": options,
@@ -811,7 +812,7 @@ def default_cluster_payload(stops_df: pd.DataFrame, depots_df: pd.DataFrame, k: 
 
     payload: Dict[str, Any] = {
         "description": f"Clusters_{k}_{now_iso()}",
-        "locations": locations,
+        "locations": {"id": 1, "location": locations},
         "jobs": jobs,
         "routing": {
             "mode": routing_cfg.get("mode", "car"),
