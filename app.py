@@ -1,8 +1,10 @@
+# app.py — NextBillion.ai Visual API Tester (stable maps + VRP v2 payload fix)
+# Run: streamlit run app.py
+
 import json
 import math
 import random
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,172 +12,172 @@ import pandas as pd
 import requests
 import streamlit as st
 import folium
-from folium import plugins
+from folium.plugins import PolyLineTextPath
 from streamlit_folium import st_folium
 
-# =========================
+# =============================
 # CONFIG
-# =========================
+# =============================
+NB_API_KEY = "a08a2b15af0f432c8e438403bc2b00e3"  # embedded as requested
+BASE_URL = "https://api.nextbillion.io"          # NextBillion public API base
+UA = "NB-Visual-Tester/1.0"
+
+DEFAULT_CENTER = (28.6139, 77.2090)  # New Delhi
+DEFAULT_COUNTRY = "IND"              # ISO3-like used by many NB endpoints
+
 st.set_page_config(page_title="NextBillion.ai — Visual API Tester", layout="wide")
 
-# User explicitly asked to embed key:
-API_KEY = "a08a2b15af0f432c8e438403bc2b00e3"
-BASE_URL = "https://api.nextbillion.io"
+# =============================
+# SESSION STATE INIT
+# =============================
+def ss_init():
+    ss = st.session_state
+    ss.setdefault("api_key", NB_API_KEY)
 
-YESNO = ["No", "Yes"]
+    # center: where we generate/search around
+    ss.setdefault("center", {"lat": DEFAULT_CENTER[0], "lng": DEFAULT_CENTER[1], "country": DEFAULT_COUNTRY})
+    ss.setdefault("last_clicked", None)  # {"lat":..., "lng":...}
 
-# Navigation API avoid values (from docs/examples)
-NAV_AVOID_OPTIONS = [
-    "toll",
-    "highway",
-    "ferry",
-    "sharp_turn",
-]
+    # stops table
+    ss.setdefault("stops", [])  # list of dicts {label,address,lat,lng,source}
 
-# Travel modes commonly used in routing APIs
-TRAVEL_MODES = ["car", "truck", "bike", "pedestrian"]
+    # persisted results (so maps never disappear)
+    ss.setdefault("geocode_last", None)
+    ss.setdefault("places_last", None)
+    ss.setdefault("directions_before", None)
+    ss.setdefault("directions_after", None)
+    ss.setdefault("vrp_last", None)
+    ss.setdefault("dm_last", None)
+    ss.setdefault("snap_last", None)
+    ss.setdefault("iso_last", None)
 
-# Optimization objective travel_cost used in v2 example payloads
-OPT_OBJECTIVES = ["distance", "duration"]
+    # settings / options
+    ss.setdefault("global_opts", {
+        "mode": "car",
+        "avoid": [],
+        "units": "metric",
+        "traffic": False,
+        "departure_time": None,  # unix seconds
+        "alternatives": False,
+    })
 
-# =========================
+ss_init()
+
+# =============================
 # HELPERS
-# =========================
-
-def human_unix(ts: Optional[int]) -> str:
-    if not ts:
-        return ""
+# =============================
+def http_get(path: str, params: Dict[str, Any], timeout: int = 60) -> Tuple[int, Dict[str, Any]]:
+    url = f"{BASE_URL}{path}"
+    params = dict(params or {})
+    params["key"] = st.session_state.api_key
+    headers = {"User-Agent": UA}
+    r = requests.get(url, params=params, headers=headers, timeout=timeout)
     try:
-        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone()
-        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+        return r.status_code, r.json()
     except Exception:
-        return str(ts)
+        return r.status_code, {"raw": r.text}
 
-def km(meters: float) -> float:
-    return meters / 1000.0
-
-def mins(seconds: float) -> float:
-    return seconds / 60.0
-
-def clamp_int(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, v))
-
-def safe_float(x, default=None):
+def http_post(path: str, payload: Dict[str, Any], params: Optional[Dict[str, Any]] = None, timeout: int = 60) -> Tuple[int, Dict[str, Any]]:
+    url = f"{BASE_URL}{path}"
+    params = dict(params or {})
+    params["key"] = st.session_state.api_key
+    headers = {"User-Agent": UA, "Content-Type": "application/json"}
+    r = requests.post(url, params=params, headers=headers, data=json.dumps(payload), timeout=timeout)
     try:
-        return float(x)
+        return r.status_code, r.json()
     except Exception:
-        return default
+        return r.status_code, {"raw": r.text}
 
-def latlng_str(lat: float, lng: float) -> str:
+def normalize_latlng_str(lat: float, lng: float) -> str:
     return f"{lat:.6f},{lng:.6f}"
 
-def parse_latlng_line(line: str) -> Optional[Tuple[float, float]]:
-    line = line.strip()
-    if not line:
-        return None
-    # accept "lat,lng" or "lat lng"
-    if "," in line:
-        parts = [p.strip() for p in line.split(",")]
-    else:
-        parts = [p.strip() for p in line.split()]
-    if len(parts) != 2:
-        return None
-    lat = safe_float(parts[0])
-    lng = safe_float(parts[1])
-    if lat is None or lng is None:
-        return None
-    return lat, lng
+def epoch_to_human(ts: Optional[int]) -> str:
+    if not ts:
+        return "None"
+    dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def haversine_km(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    lat1, lon1 = a
-    lat2, lon2 = b
-    R = 6371.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    h = (math.sin(dlat / 2) ** 2) + math.cos(p1) * math.cos(p2) * (math.sin(dlon / 2) ** 2)
-    return 2 * R * math.asin(math.sqrt(h))
-
-def random_points_around(center: Tuple[float, float], radius_m: int, n: int) -> List[Tuple[float, float]]:
-    """Generate random lat/lng points within radius meters around center."""
-    lat0, lng0 = center
-    out = []
-    for _ in range(n):
-        # Random distance and bearing
-        r = radius_m * math.sqrt(random.random())
-        theta = 2 * math.pi * random.random()
-        dx = r * math.cos(theta)
-        dy = r * math.sin(theta)
-
-        # Convert meters to degrees
-        dlat = dy / 111_320.0
-        dlng = dx / (111_320.0 * math.cos(math.radians(lat0)) + 1e-9)
-        out.append((lat0 + dlat, lng0 + dlng))
-    return out
-
-def nb_get(path: str, params: Dict[str, Any], timeout: int = 30) -> Tuple[int, Dict[str, Any]]:
-    url = f"{BASE_URL}{path}"
-    params = dict(params or {})
-    params["key"] = API_KEY
-    r = requests.get(url, params=params, timeout=timeout)
+def human_to_epoch(dt_str: str) -> Optional[int]:
+    # expects "YYYY-mm-dd HH:MM" local-ish, convert to UTC naive
     try:
-        return r.status_code, r.json()
+        dt = datetime.strptime(dt_str.strip(), "%Y-%m-%d %H:%M")
+        # treat as local time then convert to epoch as-is (good enough for testing)
+        return int(dt.replace(tzinfo=timezone.utc).timestamp())
     except Exception:
-        return r.status_code, {"raw": r.text}
+        return None
 
-def nb_post(path: str, params: Dict[str, Any], body: Dict[str, Any], timeout: int = 60) -> Tuple[int, Dict[str, Any]]:
-    url = f"{BASE_URL}{path}"
-    params = dict(params or {})
-    params["key"] = API_KEY
-    r = requests.post(url, params=params, json=body, timeout=timeout)
-    try:
-        return r.status_code, r.json()
-    except Exception:
-        return r.status_code, {"raw": r.text}
+def parse_stops_df() -> pd.DataFrame:
+    rows = st.session_state.stops
+    if not rows:
+        return pd.DataFrame(columns=["label", "address", "lat", "lng", "source"])
+    return pd.DataFrame(rows)
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def cached_get(path: str, params_json: str) -> Tuple[int, Dict[str, Any]]:
-    params = json.loads(params_json)
-    return nb_get(path, params=params)
+def set_stops_from_df(df: pd.DataFrame):
+    df = df.copy()
+    for c in ["label", "address", "lat", "lng", "source"]:
+        if c not in df.columns:
+            df[c] = None
+    stops = []
+    for _, r in df.iterrows():
+        stops.append({
+            "label": str(r.get("label") or "").strip() or None,
+            "address": str(r.get("address") or "").strip() or None,
+            "lat": None if pd.isna(r.get("lat")) else float(r.get("lat")),
+            "lng": None if pd.isna(r.get("lng")) else float(r.get("lng")),
+            "source": str(r.get("source") or "").strip() or None,
+        })
+    st.session_state.stops = stops
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def cached_post(path: str, params_json: str, body_json: str) -> Tuple[int, Dict[str, Any]]:
-    params = json.loads(params_json)
-    body = json.loads(body_json)
-    return nb_post(path, params=params, body=body)
+def add_stops(new_stops: List[Dict[str, Any]]):
+    # avoid duplicates by (lat,lng,address)
+    existing = {(s.get("lat"), s.get("lng"), (s.get("address") or "")) for s in st.session_state.stops}
+    for s in new_stops:
+        key = (s.get("lat"), s.get("lng"), (s.get("address") or ""))
+        if key not in existing:
+            st.session_state.stops.append(s)
+            existing.add(key)
 
+def clear_results():
+    ss = st.session_state
+    ss.geocode_last = None
+    ss.places_last = None
+    ss.directions_before = None
+    ss.directions_after = None
+    ss.vrp_last = None
+    ss.dm_last = None
+    ss.snap_last = None
+    ss.iso_last = None
+
+# ---------- Polyline decode (robust) ----------
 def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, float]]:
-    """Standard Google polyline decoding. Works for string."""
-    if not isinstance(polyline_str, str) or len(polyline_str) == 0:
+    # Standard polyline decoding (Google/HERE style)
+    if not isinstance(polyline_str, str) or not polyline_str:
         return []
-    index = 0
-    lat = 0
-    lng = 0
+    index, lat, lng = 0, 0, 0
     coordinates = []
     factor = 10 ** precision
 
-    length = len(polyline_str)
-    while index < length:
-        result = 1
-        shift = 0
-        b = 0
+    while index < len(polyline_str):
+        result, shift = 0, 0
         while True:
+            if index >= len(polyline_str):
+                return coordinates
             b = ord(polyline_str[index]) - 63
             index += 1
-            result += (b & 0x1f) << shift
+            result |= (b & 0x1F) << shift
             shift += 5
             if b < 0x20:
                 break
         dlat = ~(result >> 1) if (result & 1) else (result >> 1)
         lat += dlat
 
-        result = 1
-        shift = 0
+        result, shift = 0, 0
         while True:
+            if index >= len(polyline_str):
+                return coordinates
             b = ord(polyline_str[index]) - 63
             index += 1
-            result += (b & 0x1f) << shift
+            result |= (b & 0x1F) << shift
             shift += 5
             if b < 0x20:
                 break
@@ -185,991 +187,953 @@ def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, 
         coordinates.append((lat / factor, lng / factor))
     return coordinates
 
-def extract_route_coords(resp: Dict[str, Any]) -> List[Tuple[float, float]]:
+def extract_route_coords(directions_json: Dict[str, Any]) -> List[Tuple[float, float]]:
     """
-    Try multiple possible response shapes:
-    - routes[0].overview_polyline.points
+    Tries multiple schemas:
     - routes[0].geometry (polyline string)
-    - routes[0].geometry.coordinates (GeoJSON)
-    - routes[0].legs[].steps[].polyline / geometry
+    - routes[0].polyline (polyline string)
+    - routes[0].shape (list of "lat,lng")
+    - routes[0].legs[*].steps[*].geometry (polyline string)
     """
-    # 1) Google-ish
-    try:
-        pts = resp["routes"][0]["overview_polyline"]["points"]
-        coords = decode_polyline(pts, precision=5)
-        if coords:
-            return coords
-    except Exception:
-        pass
+    if not isinstance(directions_json, dict):
+        return []
 
-    # 2) geometry polyline string
-    try:
-        geom = resp["routes"][0].get("geometry")
-        if isinstance(geom, str):
-            coords = decode_polyline(geom, precision=5)
+    routes = directions_json.get("routes") or directions_json.get("route") or []
+    if isinstance(routes, dict):
+        routes = [routes]
+    if not routes:
+        return []
+
+    r0 = routes[0]
+    for k in ["geometry", "polyline"]:
+        if isinstance(r0.get(k), str):
+            coords = decode_polyline(r0[k], precision=5)
             if coords:
                 return coords
-    except Exception:
-        pass
 
-    # 3) GeoJSON coordinates
-    try:
-        coords = resp["routes"][0]["geometry"]["coordinates"]
-        # assume [lng,lat]
-        out = [(c[1], c[0]) for c in coords if isinstance(c, (list, tuple)) and len(c) >= 2]
-        if out:
-            return out
-    except Exception:
-        pass
+    if isinstance(r0.get("shape"), list) and r0["shape"]:
+        coords = []
+        for s in r0["shape"]:
+            if isinstance(s, str) and "," in s:
+                a, b = s.split(",", 1)
+                coords.append((float(a), float(b)))
+        if coords:
+            return coords
 
-    # 4) accumulate from legs/steps
-    out = []
-    try:
-        legs = resp["routes"][0].get("legs", [])
-        for leg in legs:
-            for step in leg.get("steps", []):
-                if "polyline" in step and isinstance(step["polyline"], str):
-                    out.extend(decode_polyline(step["polyline"], precision=5))
-                elif "geometry" in step and isinstance(step["geometry"], str):
-                    out.extend(decode_polyline(step["geometry"], precision=5))
-        if out:
-            return out
-    except Exception:
-        pass
+    # deep steps
+    legs = r0.get("legs") or []
+    coords = []
+    for leg in legs:
+        steps = leg.get("steps") or []
+        for stp in steps:
+            g = stp.get("geometry")
+            if isinstance(g, str):
+                coords.extend(decode_polyline(g, precision=5))
+    return coords
 
-    return []
-
-def compute_directions_totals(resp: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    """Return (distance_m, duration_s)"""
-    try:
-        r0 = resp["routes"][0]
-        dist = r0.get("distance")
-        dur = r0.get("duration")
-        if dist is not None and dur is not None:
-            return float(dist), float(dur)
-    except Exception:
-        pass
-
-    # fallback sum legs
-    try:
-        dist = 0.0
-        dur = 0.0
-        legs = resp["routes"][0].get("legs", [])
-        for leg in legs:
-            dist += float(leg.get("distance", 0))
-            dur += float(leg.get("duration", 0))
-        if dist > 0 or dur > 0:
-            return dist, dur
-    except Exception:
-        pass
-    return None, None
-
-def make_numbered_icon_html(num: int) -> str:
-    # Red pin-like badge with number
-    return f"""
-    <div style="
-        background:#E53935;
-        color:white;
-        border-radius:18px;
-        width:28px;height:28px;
-        display:flex;align-items:center;justify-content:center;
-        font-weight:700;font-size:14px;
-        box-shadow:0 2px 6px rgba(0,0,0,0.35);
-        border:2px solid white;
-    ">{num}</div>
+def extract_total_distance_duration(directions_json: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     """
+    Returns (distance_km, duration_min) if possible.
+    Tries common fields:
+    - routes[0].distance (meters) & routes[0].duration (seconds)
+    - routes[0].summary.distance / summary.duration
+    """
+    if not isinstance(directions_json, dict):
+        return None, None
+    routes = directions_json.get("routes") or []
+    if isinstance(routes, dict):
+        routes = [routes]
+    if not routes:
+        return None, None
+    r0 = routes[0]
+    dist_m = None
+    dur_s = None
+    if isinstance(r0.get("distance"), (int, float)):
+        dist_m = float(r0["distance"])
+    if isinstance(r0.get("duration"), (int, float)):
+        dur_s = float(r0["duration"])
+    summ = r0.get("summary") or {}
+    if dist_m is None and isinstance(summ.get("distance"), (int, float)):
+        dist_m = float(summ["distance"])
+    if dur_s is None and isinstance(summ.get("duration"), (int, float)):
+        dur_s = float(summ["duration"])
 
-def build_map(
-    center: Tuple[float, float],
-    stops: List[Dict[str, Any]],
-    route_coords: Optional[List[Tuple[float, float]]] = None,
-    route_color: str = "#1976D2",
-    click_marker: Optional[Tuple[float, float]] = None,
-    zoom: int = 12,
-) -> folium.Map:
-    m = folium.Map(location=list(center), zoom_start=zoom, control_scale=True)
+    dist_km = None if dist_m is None else dist_m / 1000.0
+    dur_min = None if dur_s is None else dur_s / 60.0
+    return dist_km, dur_min
 
-    # Stops
-    for idx, s in enumerate(stops, start=1):
-        lat = s.get("lat")
-        lng = s.get("lng")
-        if lat is None or lng is None:
-            continue
-        html = make_numbered_icon_html(idx)
-        icon = folium.DivIcon(html=html)
-        tooltip = s.get("label") or f"Stop {idx}"
-        popup = folium.Popup(f"<b>{tooltip}</b><br/>{s.get('address','')}", max_width=350)
-        folium.Marker([lat, lng], tooltip=tooltip, popup=popup, icon=icon).add_to(m)
-
-    # Optional click marker (plain pin)
-    if click_marker:
-        folium.Marker(
-            list(click_marker),
-            tooltip="Clicked center",
-            icon=folium.Icon(color="red", icon="map-marker"),
-        ).add_to(m)
-
-    # Route polyline
-    if route_coords and len(route_coords) >= 2:
-        folium.PolyLine(route_coords, weight=5, opacity=0.9, color=route_color).add_to(m)
-
-    plugins.Fullscreen().add_to(m)
+# ---------- Map rendering (stable) ----------
+def base_map(center_lat: float, center_lng: float, zoom: int = 12) -> folium.Map:
+    m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom, control_scale=True)
     return m
 
-def ensure_state():
-    ss = st.session_state
-    if "stops" not in ss:
-        ss.stops = []  # list of dicts: label,address,lat,lng,source
-    if "center" not in ss:
-        ss.center = (28.6139, 77.2090)  # default Delhi
-    if "country_filter" not in ss:
-        ss.country_filter = "IND"
-    if "places_last" not in ss:
-        ss.places_last = None
-    if "geocode_last" not in ss:
-        ss.geocode_last = None
-    if "directions_before" not in ss:
-        ss.directions_before = None
-    if "directions_after" not in ss:
-        ss.directions_after = None
-    if "vrp_job" not in ss:
-        ss.vrp_job = None  # {"id":..., "create_resp":...}
-    if "vrp_result" not in ss:
-        ss.vrp_result = None
-    if "map_versions" not in ss:
-        ss.map_versions = {"geocode": 0, "places": 0, "before": 0, "after": 0, "snap": 0, "iso": 0}
-    if "places_click" not in ss:
-        ss.places_click = None
+def add_numbered_markers(m: folium.Map, stops: List[Dict[str, Any]], color: str = "red"):
+    for i, s in enumerate(stops, start=1):
+        lat, lng = s.get("lat"), s.get("lng")
+        if lat is None or lng is None:
+            continue
+        popup = folium.Popup(
+            f"<b>{i}. {s.get('label') or ''}</b><br/>{s.get('address') or ''}<br/>{lat:.6f},{lng:.6f}",
+            max_width=300
+        )
+        folium.Marker(
+            location=[lat, lng],
+            popup=popup,
+            icon=folium.DivIcon(
+                html=f"""
+                <div style="
+                    background:{color};
+                    color:white;
+                    border-radius:16px;
+                    width:28px;
+                    height:28px;
+                    text-align:center;
+                    line-height:28px;
+                    font-weight:700;
+                    border:2px solid white;
+                    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+                ">{i}</div>
+                """
+            ),
+        ).add_to(m)
 
-ensure_state()
-ss = st.session_state
+def add_route_polyline_with_arrows(m: folium.Map, coords: List[Tuple[float, float]]):
+    if not coords or len(coords) < 2:
+        return
+    pl = folium.PolyLine(coords, weight=6, opacity=0.8)
+    pl.add_to(m)
+    # arrows
+    PolyLineTextPath(
+        pl,
+        "▶",
+        repeat=True,
+        offset=10,
+        attributes={"fill": "black", "font-weight": "bold", "font-size": "16"},
+    ).add_to(m)
 
-# =========================
-# HEADER
-# =========================
+def render_map(m: folium.Map, key: str, height: int = 520) -> Dict[str, Any]:
+    # stable render; key MUST remain constant per map slot
+    return st_folium(m, height=height, width="stretch", key=key)
+
+# =============================
+# UI — SIDEBAR (Stops input)
+# =============================
 st.title("NextBillion.ai — Visual API Tester")
-st.caption("Stops are shared across all tabs. Nothing calls the API until you click a button (forms prevent auto-reruns).")
 
-# =========================
-# SIDEBAR: STOP MANAGER
-# =========================
+ss = st.session_state
+st.caption(f"Stops loaded: **{len(ss.stops)}**")
+
 with st.sidebar:
-    st.header("Stops (shared)")
-
-    st.write(f"Stops loaded: **{len(ss.stops)}**")
-    st.write(f"Current center: **{ss.center[0]:.5f},{ss.center[1]:.5f}** | Country filter: **{ss.country_filter}**")
+    st.header("Config")
+    ss.api_key = st.text_input("NextBillion API Key", value=ss.api_key, type="password")
 
     st.divider()
-    st.subheader("Add/Replace Stops (easy input)")
+    st.subheader("Stops (20+ addresses)")
 
-    input_mode = st.radio("Input type", ["Addresses (one per line)", "Lat/Lng (one per line)"], index=0)
+    mode = st.radio("How to input stops?", ["Addresses (one per line)", "Lat/Lng (one per line)"], index=0)
 
-    default_text = ""
-    pasted = st.text_area("Paste at least 2 lines (supports 20+)", value=default_text, height=180)
+    stop_text = st.text_area(
+        "Paste at least 2 lines",
+        height=180,
+        placeholder=(
+            "Example (addresses):\n"
+            "78-14 138th St Flushing, NY 11367\n"
+            "2451 Webb Ave Bronx, NY 10468\n\n"
+            "Example (lat,lng):\n"
+            "28.6139,77.2090\n"
+            "28.7041,77.1025"
+        )
+    )
 
-    colA, colB = st.columns(2)
-    with colA:
+    c1, c2 = st.columns(2)
+    with c1:
         add_btn = st.button("➕ Add", use_container_width=True)
-    with colB:
+    with c2:
         replace_btn = st.button("♻️ Replace", use_container_width=True)
 
-    clear_btn = st.button("🗑️ Clear stops", use_container_width=True)
+    c3, c4 = st.columns(2)
+    with c3:
+        clear_btn = st.button("🧹 Clear Stops", use_container_width=True)
+    with c4:
+        clear_res_btn = st.button("🧽 Clear Results", use_container_width=True)
 
     if clear_btn:
         ss.stops = []
-        ss.directions_before = None
-        ss.directions_after = None
-        ss.vrp_job = None
-        ss.vrp_result = None
-
-    def add_parsed(lines: List[str], replace: bool):
-        items = []
-        for i, line in enumerate(lines, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            if input_mode.startswith("Lat/Lng"):
-                ll = parse_latlng_line(line)
-                if ll:
-                    items.append({"label": f"Stop {len(items)+1}", "address": "", "lat": ll[0], "lng": ll[1], "source": "manual latlng"})
-            else:
-                items.append({"label": f"Stop {len(items)+1}", "address": line, "lat": None, "lng": None, "source": "manual address"})
-        if replace:
-            ss.stops = items
-        else:
-            # append, re-label later
-            ss.stops.extend(items)
+    if clear_res_btn:
+        clear_results()
 
     if add_btn or replace_btn:
-        lines = pasted.splitlines()
-        add_parsed(lines, replace=bool(replace_btn))
-        # re-label sequentially
-        for idx, s in enumerate(ss.stops, start=1):
-            s["label"] = f"Stop {idx}"
+        lines = [x.strip() for x in stop_text.splitlines() if x.strip()]
+        new_stops = []
+        if mode.startswith("Addresses"):
+            for i, addr in enumerate(lines, start=1):
+                new_stops.append({"label": f"Stop {i}", "address": addr, "lat": None, "lng": None, "source": "Pasted addresses"})
+        else:
+            for i, ll in enumerate(lines, start=1):
+                if "," not in ll:
+                    continue
+                a, b = ll.split(",", 1)
+                try:
+                    lat = float(a.strip())
+                    lng = float(b.strip())
+                    new_stops.append({"label": f"Stop {i}", "address": None, "lat": lat, "lng": lng, "source": "Pasted lat,lng"})
+                except Exception:
+                    continue
+
+        if replace_btn:
+            ss.stops = new_stops
+        else:
+            add_stops(new_stops)
 
     st.divider()
-    st.subheader("Generate random stops")
-    gen_n = st.number_input("How many", min_value=2, max_value=60, value=20, step=1)
-    gen_r = st.slider("Radius (meters)", min_value=200, max_value=30000, value=5000, step=100)
-    gen_btn = st.button("🎲 Generate around current center", use_container_width=True)
+    st.subheader("Center / Country")
+    ss.center["country"] = st.text_input("Country filter (3-letter)", value=ss.center["country"])
+    st.caption(f"Current center: {ss.center['lat']:.6f},{ss.center['lng']:.6f} | Country: {ss.center['country']}")
 
-    if gen_btn:
-        pts = random_points_around(ss.center, int(gen_r), int(gen_n))
-        ss.stops = [{"label": f"Stop {i+1}", "address": "", "lat": p[0], "lng": p[1], "source": "random"} for i, p in enumerate(pts)]
-        ss.directions_before = None
-        ss.directions_after = None
-        ss.vrp_job = None
-        ss.vrp_result = None
-
-# =========================
+# =============================
 # GLOBAL ROUTE OPTIONS
-# =========================
+# =============================
 with st.expander("Global route options (Directions / Matrix / Optimize)", expanded=False):
-    c1, c2, c3, c4 = st.columns([1, 1, 2, 2])
+    colA, colB, colC, colD = st.columns(4)
+    with colA:
+        ss.global_opts["mode"] = st.selectbox("Mode", ["car", "truck", "bike", "walk"], index=0)
+    with colB:
+        ss.global_opts["units"] = st.selectbox("Units", ["metric", "imperial"], index=0)
+    with colC:
+        ss.global_opts["traffic"] = st.selectbox("Use traffic", ["No", "Yes"], index=0) == "Yes"
+    with colD:
+        ss.global_opts["alternatives"] = st.selectbox("Alternatives", ["No", "Yes"], index=0) == "Yes"
 
-    with c1:
-        mode = st.selectbox("Mode", TRAVEL_MODES, index=0, key="mode")
-    with c2:
-        traffic = st.selectbox("Traffic", ["No", "Yes"], index=0, key="traffic")
-    with c3:
-        avoid = st.multiselect("Avoid", NAV_AVOID_OPTIONS, default=[], key="avoid")
-    with c4:
-        dep = st.number_input("Departure time (unix seconds)", min_value=0, value=0, step=60, key="dep")
-        st.caption(f"Human readable: **{human_unix(dep)}**" if dep else "0 = not set")
+    avoid_choices = [
+        "toll_roads", "highways", "ferries", "tunnels", "unpaved_roads",
+        "sharp_turns", "u_turns", "borders"
+    ]
+    ss.global_opts["avoid"] = st.multiselect("Avoid (dropdown to prevent typos)", avoid_choices, default=ss.global_opts["avoid"])
 
-# =========================
+    dep_col1, dep_col2 = st.columns([2, 1])
+    with dep_col1:
+        dt_str = st.text_input("Departure time (human) — format: YYYY-mm-dd HH:MM", value="")
+    with dep_col2:
+        if st.button("Set departure", use_container_width=True):
+            ss.global_opts["departure_time"] = human_to_epoch(dt_str)
+
+    st.caption(f"Departure (unix): {ss.global_opts['departure_time']}  |  {epoch_to_human(ss.global_opts['departure_time'])}")
+
+# =============================
 # TABS
-# =========================
-tab_geocode, tab_places, tab_route_opt, tab_matrix, tab_snap_iso = st.tabs(
-    ["Geocode & Map", "Places (Search + Generate Stops)", "Route + Optimize (Before vs After)", "Distance Matrix (NxN)", "Snap-to-Road + Isochrone"]
-)
+# =============================
+tabs = st.tabs([
+    "Geocode & Map",
+    "Places (Search + Generate Stops)",
+    "Route + Optimize (Before vs After)",
+    "Distance Matrix (NxN)",
+    "Snap-to-Road + Isochrone",
+])
 
-# ==========================================================
-# TAB 1: GEOCODE & MAP
-# ==========================================================
-with tab_geocode:
+# =============================
+# TAB 1 — GEOCODE & MAP
+# =============================
+with tabs[0]:
     st.subheader("Geocode your stops and show them on the map")
-    st.caption("Tip: Geocode once → reuse lat/lng across tabs (saves API calls).")
 
-    if len(ss.stops) == 0:
-        st.info("Add stops from the sidebar (paste addresses or lat/lng, or generate random stops).")
+    df = parse_stops_df()
+    edited = st.data_editor(df, num_rows="dynamic", width="stretch", key="stops_editor_main")
+    set_stops_from_df(edited)
 
-    with st.form("geocode_form", clear_on_submit=False):
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            in_country = st.text_input("Country filter (ISO3 like IND/USA/DEU)", value=ss.country_filter)
-        with col2:
-            lang = st.text_input("Language", value="en-US")
-        do_geocode = st.form_submit_button("🌍 Geocode all address stops (cached)", use_container_width=True)
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        geocode_btn = st.button("🧭 Geocode all stops (cached)", use_container_width=True)
+    with c2:
+        create_tbl_btn = st.button("🧾 Create a clean table", use_container_width=True)
 
-    if do_geocode and len(ss.stops) > 0:
-        ss.country_filter = in_country.strip().upper() or ss.country_filter
+    if create_tbl_btn:
+        # normalize labels if missing
+        df = parse_stops_df()
+        if not df.empty:
+            for i in range(len(df)):
+                if not df.loc[i, "label"] or str(df.loc[i, "label"]).strip() == "None":
+                    df.loc[i, "label"] = f"Stop {i+1}"
+            set_stops_from_df(df)
 
-        geocoded = 0
-        last_status = None
-        last_resp = None
+    if geocode_btn:
+        # Prefer Batch Geocode if available; else fall back to Forward Geocode per address.
+        # We keep it simple and reliable.
+        df = parse_stops_df()
+        addrs = [a for a in df["address"].tolist() if isinstance(a, str) and a.strip()]
+        if not addrs:
+            st.warning("No addresses found to geocode. (Lat/Lng-only stops are already usable.)")
+        else:
+            payload = {"addresses": addrs}
+            # Try Batch Geocode (docs list it); if it fails, fall back.
+            status, data = http_post("/batch_geocode", payload, timeout=60)
+            if status != 200:
+                # fallback forward geocode
+                resolved = []
+                prog = st.progress(0)
+                for i, addr in enumerate(addrs):
+                    params = {"q": addr}
+                    # Many place APIs use /geocode?; NextBillion docs list Forward Geocode but
+                    # path differs by deployment; we try /geocode first, then /forward.
+                    s1, d1 = http_get("/geocode", params=params, timeout=30)
+                    if s1 != 200:
+                        s1, d1 = http_get("/places/v1/geocode", params=params, timeout=30)
+                    if s1 == 200:
+                        resolved.append({"address": addr, "data": d1})
+                    prog.progress((i + 1) / max(1, len(addrs)))
+                data = {"fallback": resolved}
 
-        for s in ss.stops:
-            if s.get("lat") is not None and s.get("lng") is not None:
-                continue
-            addr = (s.get("address") or "").strip()
-            if not addr:
-                continue
+            ss.geocode_last = {"status": status, "data": data, "ts": time.time()}
 
-            # Geocoding API: /geocode?at=...&q=...&in=countryCode:... :contentReference[oaicite:9]{index=9}
-            params = {
-                "q": addr,
-                "in": f"countryCode:{ss.country_filter}",
-                "lang": lang,
-            }
-            # use center bias if available
-            params["at"] = latlng_str(ss.center[0], ss.center[1])
+            # Apply results back to stops if we can detect lat/lng
+            df = parse_stops_df()
+            updated = df.copy()
+            addr_to_latlng = {}
 
-            status, resp = cached_get("/geocode", json.dumps(params, sort_keys=True))
-            last_status, last_resp = status, resp
+            # attempt parse batch style
+            if isinstance(data, dict):
+                # common patterns
+                results = data.get("results") or data.get("items") or data.get("data") or None
+                if isinstance(results, list):
+                    for r in results:
+                        addr = r.get("address") or r.get("input") or r.get("query")
+                        pos = r.get("position") or r.get("location") or r.get("pos")
+                        if isinstance(pos, dict) and "lat" in pos and "lng" in pos and addr:
+                            addr_to_latlng[addr] = (float(pos["lat"]), float(pos["lng"]))
+                # fallback pattern
+                if "fallback" in data and isinstance(data["fallback"], list):
+                    for item in data["fallback"]:
+                        addr = item.get("address")
+                        d1 = item.get("data") or {}
+                        items = d1.get("items") or d1.get("results") or []
+                        if items and isinstance(items, list):
+                            pos = items[0].get("position") or items[0].get("location") or {}
+                            if isinstance(pos, dict) and "lat" in pos and "lng" in pos and addr:
+                                addr_to_latlng[addr] = (float(pos["lat"]), float(pos["lng"]))
 
-            items = resp.get("items") if isinstance(resp, dict) else None
-            if status == 200 and items and isinstance(items, list) and len(items) > 0:
-                pos = items[0].get("position", {})
-                lat = pos.get("lat")
-                lng = pos.get("lng")
-                if lat is not None and lng is not None:
-                    s["lat"] = float(lat)
-                    s["lng"] = float(lng)
-                    s["source"] = f"geocode:{ss.country_filter}"
-                    geocoded += 1
+            for i in range(len(updated)):
+                addr = updated.loc[i, "address"]
+                if isinstance(addr, str) and addr in addr_to_latlng:
+                    updated.loc[i, "lat"] = addr_to_latlng[addr][0]
+                    updated.loc[i, "lng"] = addr_to_latlng[addr][1]
+                    if not updated.loc[i, "source"]:
+                        updated.loc[i, "source"] = "Geocoded"
 
-        ss.geocode_last = {"status": last_status, "resp": last_resp}
-        ss.map_versions["geocode"] += 1
+            set_stops_from_df(updated)
 
-        st.success(f"Geocoded {geocoded} stop(s).")
-
-    # Show stops table
-    if len(ss.stops) > 0:
-        df = pd.DataFrame(ss.stops)
-        st.dataframe(df, width="stretch", hide_index=True)
-
-    # Map always renders (persisted)
-    center = ss.center
-    # auto-center to average of known stops
-    coords = [(s["lat"], s["lng"]) for s in ss.stops if s.get("lat") is not None and s.get("lng") is not None]
-    if coords:
-        lat_avg = sum([c[0] for c in coords]) / len(coords)
-        lng_avg = sum([c[1] for c in coords]) / len(coords)
-        center = (lat_avg, lng_avg)
-
-    m = build_map(center=center, stops=ss.stops, zoom=11)
-    st_folium(m, height=520, width="stretch", key=f"map_geocode_{ss.map_versions['geocode']}")
-
-    # Export JSON
-    if len(ss.stops) > 0:
-        st.download_button(
-            "⬇️ Download Stops JSON",
-            data=json.dumps(ss.stops, indent=2),
-            file_name="stops.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+    # Map (always re-renders from session_state; never disappears)
+    df = parse_stops_df()
+    valid = df.dropna(subset=["lat", "lng"])
+    if not valid.empty:
+        lat0 = float(valid.iloc[0]["lat"])
+        lng0 = float(valid.iloc[0]["lng"])
+        m = base_map(lat0, lng0, zoom=12)
+        add_numbered_markers(m, st.session_state.stops, color="red")
+        render_map(m, key="map_geocode", height=520)
+    else:
+        st.info("Add stops with lat/lng (or geocode addresses) to see pins on the map.")
 
     if ss.geocode_last:
-        with st.expander("Debug: last geocode response"):
-            st.write(f"HTTP {ss.geocode_last.get('status')}")
-            st.json(ss.geocode_last.get("resp", {}))
+        with st.expander("Download / View Geocode JSON", expanded=False):
+            st.download_button(
+                "⬇️ Download Geocode JSON",
+                data=json.dumps(ss.geocode_last, indent=2),
+                file_name="geocode_last.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            st.json(ss.geocode_last)
 
-# ==========================================================
-# TAB 2: PLACES (SEARCH + GENERATE STOPS)
-# ==========================================================
-with tab_places:
-    st.subheader("Search region/city → set center → (optional) search POIs → generate 20+ stops")
+# =============================
+# TAB 2 — PLACES (REGION SEARCH + GENERATE STOPS)
+# =============================
+with tabs[1]:
+    st.subheader("Search region/city → set center → generate random stops OR search POIs → add as stops")
 
-    # ---- Region search using geocode (works globally)
-    with st.form("region_form", clear_on_submit=False):
+    # ----- Step A: Region search (universal) -----
+    with st.form("region_search_form", clear_on_submit=False):
         region_q = st.text_input("Region/City/State/Country", value="Delhi")
-        region_country = st.text_input("Country filter (ISO3, optional)", value=ss.country_filter)
-        region_btn = st.form_submit_button("🔎 Search Region", use_container_width=True)
+        submit_region = st.form_submit_button("Search Region")
 
     region_results = []
-    if region_btn:
-        params = {
-            "q": region_q,
-            "lang": "en-US",
-        }
-        if region_country.strip():
-            params["in"] = f"countryCode:{region_country.strip().upper()}"
-        status, resp = cached_get("/geocode", json.dumps(params, sort_keys=True))
-        items = resp.get("items", []) if isinstance(resp, dict) else []
-        region_results = items if isinstance(items, list) else []
-        ss.places_last = {"region": {"status": status, "resp": resp}}
-        st.success(f"Region search: HTTP {status}")
+    if submit_region:
+        # Use forward geocode to get a region center
+        status, data = http_get("/geocode", params={"q": region_q}, timeout=30)
+        if status != 200:
+            status, data = http_get("/places/v1/geocode", params={"q": region_q}, timeout=30)
+        ss.places_last = {"region_search": {"status": status, "data": data, "q": region_q}, "ts": time.time()}
+
+        items = data.get("items") or data.get("results") or []
+        if isinstance(items, list):
+            for it in items[:10]:
+                title = it.get("title") or it.get("name") or it.get("label") or "Result"
+                pos = it.get("position") or it.get("location") or {}
+                if isinstance(pos, dict) and "lat" in pos and "lng" in pos:
+                    region_results.append((title, float(pos["lat"]), float(pos["lng"])))
 
     if region_results:
-        options = []
-        for it in region_results[:10]:
-            title = it.get("title") or it.get("address", {}).get("label") or "Result"
-            pos = it.get("position", {})
-            options.append((title, pos.get("lat"), pos.get("lng"), it))
-        pick = st.selectbox("Pick a region result", options, format_func=lambda x: x[0])
-        if st.button("✅ Use picked region as center", use_container_width=True):
-            if pick[1] is not None and pick[2] is not None:
-                ss.center = (float(pick[1]), float(pick[2]))
-                if region_country.strip():
-                    ss.country_filter = region_country.strip().upper()
-                ss.map_versions["places"] += 1
-                st.success(f"Center set to {ss.center[0]:.6f},{ss.center[1]:.6f}")
+        pick = st.selectbox("Pick a region result", [r[0] for r in region_results], key="region_pick")
+        chosen = next(r for r in region_results if r[0] == pick)
+        if st.button("Use picked region as center", use_container_width=True):
+            ss.center["lat"], ss.center["lng"] = chosen[1], chosen[2]
 
-    st.write(f"**Current center:** {ss.center[0]:.6f},{ss.center[1]:.6f} | **Country filter:** {ss.country_filter}")
+    st.caption(f"Current center: {ss.center['lat']:.6f},{ss.center['lng']:.6f} | Country filter: {ss.center['country']}")
 
-    # ---- Click map to set center
-    st.caption("Option: click on map to drop a pin, then use it as center.")
-    click_map = build_map(center=ss.center, stops=[], click_marker=ss.places_click, zoom=11)
-    click_data = st_folium(click_map, height=420, width="stretch", key=f"map_places_click_{ss.map_versions['places']}")
-    if click_data and click_data.get("last_clicked"):
-        lat = click_data["last_clicked"]["lat"]
-        lng = click_data["last_clicked"]["lng"]
-        ss.places_click = (lat, lng)
+    # ----- Click-to-set-center map (shows clicked pin) -----
+    st.markdown("### Optional: Click map to set center")
+    m = base_map(ss.center["lat"], ss.center["lng"], zoom=12)
+    # show center marker
+    folium.Marker([ss.center["lat"], ss.center["lng"]], tooltip="Current center").add_to(m)
 
-    colx, coly = st.columns(2)
-    with colx:
-        if st.button("📍 Use clicked pin as center", use_container_width=True):
-            if ss.places_click:
-                ss.center = ss.places_click
-                ss.map_versions["places"] += 1
-    with coly:
-        if st.button("❌ Clear clicked pin", use_container_width=True):
-            ss.places_click = None
-            ss.map_versions["places"] += 1
+    if ss.last_clicked:
+        folium.Marker([ss.last_clicked["lat"], ss.last_clicked["lng"]], tooltip="Clicked point", icon=folium.Icon(color="red")).add_to(m)
 
-    st.divider()
+    out = render_map(m, key="map_places_center", height=420)
+    if out and out.get("last_clicked"):
+        ss.last_clicked = {"lat": out["last_clicked"]["lat"], "lng": out["last_clicked"]["lng"]}
+        st.success(f"Clicked: {ss.last_clicked['lat']:.6f},{ss.last_clicked['lng']:.6f}")
 
-    # ---- Discover (POI keyword search) :contentReference[oaicite:10]{index=10}
+        cA, cB = st.columns(2)
+        with cA:
+            if st.button("Use clicked point as center", use_container_width=True):
+                ss.center["lat"], ss.center["lng"] = ss.last_clicked["lat"], ss.last_clicked["lng"]
+        with cB:
+            if st.button("Clear clicked point", use_container_width=True):
+                ss.last_clicked = None
+
+    # ----- Generate random stops around center (NO keyword required) -----
+    st.markdown("### Generate random stops around current center (no keyword needed)")
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        n_random = st.number_input("How many stops?", min_value=2, max_value=60, value=20, step=1)
+    with col2:
+        radius_m = st.number_input("Radius (meters)", min_value=200, max_value=50000, value=4000, step=200)
+    with col3:
+        jitter = st.selectbox("Distribution", ["Uniform", "Clustered"], index=0)
+
+    if st.button("🎲 Generate random stops", use_container_width=True):
+        lat0, lng0 = ss.center["lat"], ss.center["lng"]
+        new_stops = []
+        for i in range(int(n_random)):
+            # meters -> degrees approx
+            r = random.random()
+            if jitter == "Clustered":
+                r = r * r
+            ang = random.random() * 2 * math.pi
+            dist = r * radius_m
+            dlat = (dist * math.cos(ang)) / 111_320.0
+            dlng = (dist * math.sin(ang)) / (111_320.0 * math.cos(math.radians(lat0)) + 1e-9)
+            lat = lat0 + dlat
+            lng = lng0 + dlng
+            new_stops.append({
+                "label": f"Rand {i+1}",
+                "address": None,
+                "lat": float(lat),
+                "lng": float(lng),
+                "source": f"Random within {radius_m}m",
+            })
+        add_stops(new_stops)
+
+    # ----- Optional POI keyword search (anchored around center) -----
     st.markdown("### Optional: POI keyword search (Discover) and add results as stops")
-    with st.form("poi_form", clear_on_submit=False):
+    with st.form("poi_search_form", clear_on_submit=False):
         poi_q = st.text_input("POI keyword (e.g., petrol, hospital, warehouse)", value="petrol pump")
-        poi_radius = st.slider("Search radius (m)", min_value=500, max_value=50000, value=5000, step=100)
-        poi_limit = st.slider("Max results", min_value=1, max_value=50, value=20, step=1)
-        poi_btn = st.form_submit_button("🔎 Search Places (POIs)", use_container_width=True)
+        poi_radius = st.slider("Search radius (m)", min_value=500, max_value=50000, value=5000, step=500)
+        poi_limit = st.slider("Max results", min_value=5, max_value=50, value=10, step=1)
+        submit_poi = st.form_submit_button("Search Places (POIs)")
 
     poi_items = []
-    if poi_btn:
+    if submit_poi:
+        # Many NB place search APIs return HERE-like schema (items with position)
+        # We'll call Search Places APIs if available; if not, keep your previous /discover style.
+        center = normalize_latlng_str(ss.center["lat"], ss.center["lng"])
         params = {
-            "at": latlng_str(ss.center[0], ss.center[1]),
+            "at": center,
             "q": poi_q,
             "limit": int(poi_limit),
-            "in": f"countryCode:{ss.country_filter}",
+            "radius": int(poi_radius),
+            "in": f"countryCode:{ss.center['country']}",
         }
-        status, resp = cached_get("/discover", json.dumps(params, sort_keys=True))
-        ss.places_last = {"poi": {"status": status, "resp": resp}}
+
+        # Try a couple common paths (NB deployments differ)
+        status, data = http_get("/discover", params=params, timeout=30)
+        if status == 404:
+            status, data = http_get("/places/v1/discover", params=params, timeout=30)
+        if status == 404:
+            status, data = http_get("/places/v1/search", params=params, timeout=30)
+
+        ss.places_last = {"poi_search": {"status": status, "data": data, "params": params}, "ts": time.time()}
+
+        items = data.get("items") or data.get("results") or []
+        if isinstance(items, list):
+            for it in items:
+                title = it.get("title") or it.get("name") or it.get("label") or ""
+                addr = None
+                if isinstance(it.get("address"), dict):
+                    addr = it["address"].get("label") or it["address"].get("freeformAddress")
+                addr = addr or title or None
+                pos = it.get("position") or it.get("location") or {}
+                if isinstance(pos, dict) and "lat" in pos and "lng" in pos:
+                    poi_items.append({"title": title, "address": addr, "lat": float(pos["lat"]), "lng": float(pos["lng"])})
+
         st.success(f"Places response: HTTP {status}")
-        poi_items = resp.get("items", []) if isinstance(resp, dict) else []
 
-    if poi_items:
-        rows = []
-        for it in poi_items:
-            title = it.get("title") or it.get("address", {}).get("label") or it.get("id", "Place")
-            pos = it.get("position", {})
-            lat = pos.get("lat")
-            lng = pos.get("lng")
-            rows.append({"title": title, "lat": lat, "lng": lng, "raw": it})
+        if poi_items:
+            # show + add
+            dfpoi = pd.DataFrame(poi_items)
+            st.dataframe(dfpoi, width="stretch", height=220)
 
-        dfp = pd.DataFrame([{"title": r["title"], "lat": r["lat"], "lng": r["lng"]} for r in rows])
-        st.dataframe(dfp, width="stretch", hide_index=True)
+            if st.button("➕ Add POI results as stops", use_container_width=True):
+                new_stops = []
+                base_n = len(ss.stops)
+                for i, r in enumerate(poi_items, start=1):
+                    new_stops.append({
+                        "label": f"POI {base_n+i}",
+                        "address": r.get("address"),
+                        "lat": r.get("lat"),
+                        "lng": r.get("lng"),
+                        "source": f"POI: {poi_q}",
+                    })
+                add_stops(new_stops)
+        else:
+            st.warning("No POI items found (or response schema differed). Try a larger radius or different keyword.")
 
-        if st.button("➕ Add all POI results as stops", use_container_width=True):
-            new = []
-            for r in rows:
-                if r["lat"] is None or r["lng"] is None:
-                    continue
-                new.append({
-                    "label": f"Stop {len(ss.stops) + len(new) + 1}",
-                    "address": r["title"],
-                    "lat": float(r["lat"]),
-                    "lng": float(r["lng"]),
-                    "source": "discover",
-                })
-            ss.stops.extend(new)
-            # re-label
-            for i, s in enumerate(ss.stops, start=1):
-                s["label"] = f"Stop {i}"
-            ss.map_versions["places"] += 1
-            st.success(f"Added {len(new)} stop(s).")
-
-        st.download_button(
-            "⬇️ Download Places JSON",
-            data=json.dumps(ss.places_last, indent=2),
-            file_name="places.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+    # Map showing current stops (always visible)
+    st.markdown("### Stops map (current)")
+    df = parse_stops_df()
+    valid = df.dropna(subset=["lat", "lng"])
+    if not valid.empty:
+        m2 = base_map(ss.center["lat"], ss.center["lng"], zoom=12)
+        add_numbered_markers(m2, ss.stops, color="red")
+        render_map(m2, key="map_places_stops", height=520)
     else:
-        st.info("No POI results yet. Try a broader keyword (e.g., 'gas', 'market') or increase radius.")
+        st.info("No valid stops with lat/lng yet.")
 
-    st.divider()
+    if ss.places_last:
+        with st.expander("Download / View Places JSON", expanded=False):
+            st.download_button(
+                "⬇️ Download Places JSON",
+                data=json.dumps(ss.places_last, indent=2),
+                file_name="places_last.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            st.json(ss.places_last)
 
-    # ---- Generate random stops around center (without keyword)
-    st.markdown("### Generate random test stops around the current center (no keyword needed)")
-    with st.form("gen_form", clear_on_submit=False):
-        gn = st.number_input("How many stops", min_value=2, max_value=60, value=20, step=1)
-        gr = st.slider("Generation radius (m)", min_value=200, max_value=50000, value=8000, step=100)
-        gbtn = st.form_submit_button("🎲 Generate stops", use_container_width=True)
-
-    if gbtn:
-        pts = random_points_around(ss.center, int(gr), int(gn))
-        ss.stops = [{"label": f"Stop {i+1}", "address": "", "lat": p[0], "lng": p[1], "source": "random(center)"} for i, p in enumerate(pts)]
-        ss.directions_before = None
-        ss.directions_after = None
-        ss.vrp_job = None
-        ss.vrp_result = None
-        ss.map_versions["places"] += 1
-        st.success(f"Generated {len(ss.stops)} stops.")
-
-    # Show stops on map (persisted)
-    if len(ss.stops) > 0:
-        center2 = ss.center
-        coords2 = [(s["lat"], s["lng"]) for s in ss.stops if s.get("lat") is not None and s.get("lng") is not None]
-        if coords2:
-            lat_avg = sum([c[0] for c in coords2]) / len(coords2)
-            lng_avg = sum([c[1] for c in coords2]) / len(coords2)
-            center2 = (lat_avg, lng_avg)
-        m2 = build_map(center=center2, stops=ss.stops, zoom=11)
-        st_folium(m2, height=520, width="stretch", key=f"map_places_stops_{ss.map_versions['places']}")
-
-# ==========================================================
-# TAB 3: ROUTE + OPTIMIZE (BEFORE VS AFTER)
-# ==========================================================
-with tab_route_opt:
+# =============================
+# TAB 3 — ROUTE + OPTIMIZE (BEFORE VS AFTER)
+# =============================
+with tabs[2]:
     st.subheader("Compute route (Before) → run optimization → recompute route (After) + compare")
 
-    if len(ss.stops) < 2:
-        st.warning("Need at least 2 stops. Add or generate stops first.")
+    df = parse_stops_df()
+    valid = df.dropna(subset=["lat", "lng"]).reset_index(drop=True)
+
+    if len(valid) < 2:
+        st.warning("Need at least 2 stops with lat/lng to compute directions.")
     else:
-        coords = [(s["lat"], s["lng"]) for s in ss.stops if s.get("lat") is not None and s.get("lng") is not None]
-        if len(coords) < 2:
-            st.warning("Stops must have lat/lng. Use Geocode tab or generate random lat/lng stops.")
+        # Build waypoints list
+        coords = [(float(r["lat"]), float(r["lng"])) for _, r in valid.iterrows()]
+
+        # Avoid slider crash: only show if meaningful
+        maxN = max(2, len(coords))
+        minN = 2
+        if maxN <= minN:
+            n_for_path = 2
+            st.caption("N stops for path: 2 (only two coordinates available)")
         else:
-            # Directions form
-            with st.form("dir_form", clear_on_submit=False):
-                st.markdown("### Step 1 — Directions (Before)")
-                o = coords[0]
-                d = coords[-1]
-                way = coords[1:-1]  # up to 18+ fine
+            n_for_path = st.slider("N stops for path (if using first N)", min_value=2, max_value=maxN, value=min(10, maxN))
 
-                compute_btn = st.form_submit_button("🧭 Compute route (Before)", use_container_width=True)
+        coords_use = coords[:n_for_path]
 
-            if compute_btn:
-                params = {
-                    "origin": latlng_str(o[0], o[1]),
-                    "destination": latlng_str(d[0], d[1]),
-                    "mode": st.session_state.get("mode", "car"),
-                }
-                if way:
-                    params["waypoints"] = "|".join([latlng_str(x[0], x[1]) for x in way])
-                if st.session_state.get("avoid"):
-                    params["avoid"] = "|".join(st.session_state["avoid"])
-                if st.session_state.get("traffic") == "Yes":
-                    params["traffic"] = "true"
-                if st.session_state.get("dep", 0):
-                    params["departure_time"] = int(st.session_state["dep"])
+        def directions_call(coords_list: List[Tuple[float, float]]) -> Tuple[int, Dict[str, Any]]:
+            # Many Directions APIs accept origin/destination + waypoints or "locations" list.
+            # We'll try a flexible approach:
+            origin = normalize_latlng_str(coords_list[0][0], coords_list[0][1])
+            destination = normalize_latlng_str(coords_list[-1][0], coords_list[-1][1])
+            waypoints = [normalize_latlng_str(a, b) for (a, b) in coords_list[1:-1]]
 
-                # Navigation API: /navigation/json :contentReference[oaicite:11]{index=11}
-                status, resp = cached_get("/navigation/json", json.dumps(params, sort_keys=True))
-                ss.directions_before = {"status": status, "resp": resp, "params": params}
-                ss.map_versions["before"] += 1
+            params = {
+                "origin": origin,
+                "destination": destination,
+                "mode": ss.global_opts["mode"],
+                "units": ss.global_opts["units"],
+                "alternatives": "true" if ss.global_opts["alternatives"] else "false",
+                "geometry": "polyline",  # request route geometry
+            }
 
-                if status == 200:
-                    st.success("Directions (Before) computed.")
-                else:
-                    st.error(f"Directions (Before) failed: HTTP {status}")
-                    st.json(resp)
+            if ss.global_opts["avoid"]:
+                params["avoid"] = ",".join(ss.global_opts["avoid"])
+            if ss.global_opts["traffic"]:
+                params["traffic"] = "true"
+            if ss.global_opts["departure_time"]:
+                params["departure_time"] = int(ss.global_opts["departure_time"])
 
-            # Show BEFORE map + metrics
-            before_cols = st.columns(2)
-            with before_cols[0]:
-                st.markdown("#### Route map (Before)")
-                route_coords = []
-                dist_m = dur_s = None
-                if ss.directions_before and ss.directions_before.get("status") == 200:
-                    route_coords = extract_route_coords(ss.directions_before["resp"])
-                    dist_m, dur_s = compute_directions_totals(ss.directions_before["resp"])
+            if waypoints:
+                params["waypoints"] = "|".join(waypoints)
 
-                map_center = ss.center
-                if coords:
-                    map_center = coords[0]
-                m_before = build_map(center=map_center, stops=ss.stops, route_coords=route_coords, route_color="#1976D2", zoom=11)
-                st_folium(m_before, height=520, width="stretch", key=f"map_before_{ss.map_versions['before']}")
+            status, data = http_get("/directions", params=params, timeout=60)
+            if status == 404:
+                status, data = http_get("/directions/v2", params=params, timeout=60)
+            return status, data
 
-                if dist_m is not None and dur_s is not None:
-                    st.metric("Before distance (km)", f"{km(dist_m):.2f}")
-                    st.metric("Before duration (min)", f"{mins(dur_s):.1f}")
+        # Step 1 — Directions Before
+        colL, colR = st.columns([1, 1])
+        with colL:
+            if st.button("🧭 Compute route (Before)", use_container_width=True):
+                status, data = directions_call(coords_use)
+                ss.directions_before = {"status": status, "data": data, "ts": time.time(), "coords_used": coords_use}
+        with colR:
+            if ss.directions_before:
+                st.caption(f"Directions (Before): HTTP {ss.directions_before['status']}")
 
-                if ss.directions_before:
-                    st.download_button(
-                        "⬇️ Download Directions (Before) JSON",
-                        data=json.dumps(ss.directions_before, indent=2),
-                        file_name="directions_before.json",
-                        mime="application/json",
-                        use_container_width=True,
-                    )
+        # Render Before map + metrics
+        if ss.directions_before and ss.directions_before["status"] == 200:
+            before_coords = extract_route_coords(ss.directions_before["data"])
+            before_km, before_min = extract_total_distance_duration(ss.directions_before["data"])
 
-            # Optimization controls
-            with before_cols[1]:
-                st.markdown("#### Step 2 — Optimization (VRP v2)")
-                st.caption("Uses the v2 payload format with `locations` as a list of `lat,lng` strings + jobs referencing location_index. :contentReference[oaicite:12]{index=12}")
+            left, right = st.columns([1, 1])
+            with left:
+                st.markdown("### Route map (Before)")
+                mB = base_map(coords_use[0][0], coords_use[0][1], zoom=12)
+                add_numbered_markers(mB, [{"lat": a, "lng": b, "label": f"{i+1}"} for i, (a, b) in enumerate(coords_use)], color="red")
+                add_route_polyline_with_arrows(mB, before_coords)
+                render_map(mB, key="map_route_before", height=520)
 
-                with st.form("opt_form", clear_on_submit=False):
-                    objective = st.selectbox("Optimization objective", OPT_OBJECTIVES, index=OPT_OBJECTIVES.index("duration"))
-                    run_opt = st.form_submit_button("⚙️ Run optimization (VRP v2)", use_container_width=True)
+                if before_km is not None:
+                    st.metric("Before distance (km)", f"{before_km:.2f}")
+                if before_min is not None:
+                    st.metric("Before duration (min)", f"{before_min:.1f}")
 
-                if run_opt:
-                    # Build request similar to user's working sample structure
-                    locations = [latlng_str(lat, lng) for (lat, lng) in coords]  # includes depot at index 0
-                    jobs = []
-                    for i in range(1, len(locations)):
-                        jobs.append({"id": i, "location_index": i})
+            with right:
+                st.markdown("### Step 2 — Optimization (VRP v2)")
+                st.caption("Uses VRP v2 payload with **locations.location** present + objective object.")
 
+                objective = st.selectbox("Optimization objective (travel_cost)", ["distance", "duration"], index=0)
+
+                if st.button("⚙️ Run optimization (VRP v2)", use_container_width=True):
+                    # Build VRP v2 payload:
+                    # - locations: { id, location: ["lat,lng", ...] }  ✅ fixes locations.location missing
+                    # - jobs reference location_index
+                    # - options.objective must be an object (not a string) ✅ fixes dto.ObjectiveOption error
+                    loc_list = [normalize_latlng_str(a, b) for (a, b) in coords_use]
                     body = {
-                        "locations": locations,
-                        "vehicles": [{"id": 1, "start_location_index": 0, "end_location_index": 0}],
-                        "jobs": jobs,
+                        "locations": {"id": 1, "location": loc_list},
+                        "vehicles": [{
+                            "id": 1,
+                            "start_location_index": 0,
+                            "end_location_index": 0
+                        }],
+                        "jobs": [{"id": i + 1, "location_index": i} for i in range(1, len(loc_list))],
                         "options": {
-                            "objective": {"travel_cost": objective}
-                        },
+                            "objective": {"travel_cost": objective},
+                        }
                     }
-
-                    status, resp = cached_post("/optimization/v2", "{}", json.dumps(body, sort_keys=True))
-                    ss.vrp_job = {"status": status, "resp": resp, "request": body}
-                    ss.vrp_result = None
+                    status, data = http_post("/optimization/v2", body, timeout=60)
+                    ss.vrp_last = {"status": status, "data": data, "ts": time.time(), "request": body}
 
                     if status != 200:
                         st.error(f"VRP create failed: HTTP {status}")
-                        st.json(resp)
+                        st.json(data)
                     else:
                         st.success("VRP job created.")
-                        # Expect an id in response
-                        job_id = resp.get("id") or resp.get("job_id") or resp.get("result", {}).get("id")
-                        ss.vrp_job["job_id"] = job_id
 
-                # Poll result
-                if ss.vrp_job and ss.vrp_job.get("job_id"):
-                    job_id = ss.vrp_job["job_id"]
-                    poll_btn = st.button("📥 Fetch optimization result", use_container_width=True)
-
-                    if poll_btn:
-                        with st.spinner("Fetching result..."):
-                            # Poll up to ~10 times but keep light
-                            result = None
-                            last = None
-                            for _ in range(10):
-                                status, rr = cached_get("/optimization/v2/result", json.dumps({"id": job_id}, sort_keys=True))
-                                last = {"status": status, "resp": rr}
-                                # heuristic: if routes present, done
-                                if isinstance(rr, dict) and (rr.get("routes") or rr.get("result") or rr.get("solution")):
-                                    result = last
-                                    break
-                                time.sleep(1)
-                            ss.vrp_result = result or last
-
-                # Show AFTER if possible
-                st.markdown("#### Step 3 — Recompute Directions (After)")
-                after_route_coords = []
-                after_dist_m = after_dur_s = None
-                ordered_coords = None
-
-                if ss.vrp_result and ss.vrp_result.get("status") == 200:
-                    rr = ss.vrp_result["resp"]
-
-                    # Try to extract an optimized order: look for routes[0].steps with location_index
-                    seq = []
-                    try:
-                        routes = rr.get("routes") or rr.get("result", {}).get("routes") or []
-                        r0 = routes[0] if routes else None
-                        steps = r0.get("steps", []) if r0 else []
-                        for stp in steps:
-                            li = stp.get("location_index")
-                            if li is not None:
-                                seq.append(int(li))
-                    except Exception:
-                        seq = []
-
-                    # Fallback: if no steps, just keep original order
-                    if not seq:
-                        seq = list(range(len(coords)))
-
-                    # Build optimized stop order (unique, preserve)
-                    seen = set()
-                    seq2 = []
-                    for i in seq:
-                        if 0 <= i < len(coords) and i not in seen:
-                            seq2.append(i)
-                            seen.add(i)
-                    if 0 not in seen:
-                        seq2 = [0] + seq2
-
-                    ordered_coords = [coords[i] for i in seq2]
-
-                    # Compute directions using optimized order
-                    if len(ordered_coords) >= 2:
-                        o2 = ordered_coords[0]
-                        d2 = ordered_coords[-1]
-                        w2 = ordered_coords[1:-1]
-
-                        params2 = {
-                            "origin": latlng_str(o2[0], o2[1]),
-                            "destination": latlng_str(d2[0], d2[1]),
-                            "mode": st.session_state.get("mode", "car"),
-                        }
-                        if w2:
-                            params2["waypoints"] = "|".join([latlng_str(x[0], x[1]) for x in w2])
-                        if st.session_state.get("avoid"):
-                            params2["avoid"] = "|".join(st.session_state["avoid"])
-                        if st.session_state.get("traffic") == "Yes":
-                            params2["traffic"] = "true"
-                        if st.session_state.get("dep", 0):
-                            params2["departure_time"] = int(st.session_state["dep"])
-
-                        status2, resp2 = cached_get("/navigation/json", json.dumps(params2, sort_keys=True))
-                        ss.directions_after = {"status": status2, "resp": resp2, "params": params2, "order": seq2}
-                        ss.map_versions["after"] += 1
-
-                # Show AFTER map + comparison
-                if ss.directions_after and ss.directions_after.get("status") == 200:
-                    after_route_coords = extract_route_coords(ss.directions_after["resp"])
-                    after_dist_m, after_dur_s = compute_directions_totals(ss.directions_after["resp"])
-
-                st.markdown("#### Optimized route map (After)")
-                # Show stops in optimized order on map by reordering markers
-                map_stops_after = ss.stops
-                if ss.directions_after and ss.directions_after.get("order"):
-                    order = ss.directions_after["order"]
-                    # reorder stops for numbering on the "After" map
-                    reordered = []
-                    for idx in order:
-                        if 0 <= idx < len(ss.stops):
-                            reordered.append(ss.stops[idx])
-                    # append any missing
-                    seen_ids = {id(x) for x in reordered}
-                    for s in ss.stops:
-                        if id(s) not in seen_ids:
-                            reordered.append(s)
-                    map_stops_after = reordered
-
-                m_after = build_map(center=ss.center, stops=map_stops_after, route_coords=after_route_coords, route_color="#2E7D32", zoom=11)
-                st_folium(m_after, height=520, width="stretch", key=f"map_after_{ss.map_versions['after']}")
-
-                # Comparison metrics
-                before_dist_m = before_dur_s = None
-                if ss.directions_before and ss.directions_before.get("status") == 200:
-                    before_dist_m, before_dur_s = compute_directions_totals(ss.directions_before["resp"])
-
-                if before_dist_m and before_dur_s and after_dist_m and after_dur_s:
-                    dist_saved = before_dist_m - after_dist_m
-                    dur_saved = before_dur_s - after_dur_s
-                    dist_pct = (dist_saved / before_dist_m) * 100.0 if before_dist_m else 0
-                    dur_pct = (dur_saved / before_dur_s) * 100.0 if before_dur_s else 0
-
-                    st.markdown("### Before vs After (Savings)")
-                    cA, cB, cC, cD = st.columns(4)
-                    cA.metric("Distance saved (km)", f"{km(dist_saved):.2f}", f"{dist_pct:.1f}%")
-                    cB.metric("Time saved (min)", f"{mins(dur_saved):.1f}", f"{dur_pct:.1f}%")
-                    cC.metric("After distance (km)", f"{km(after_dist_m):.2f}")
-                    cD.metric("After duration (min)", f"{mins(after_dur_s):.1f}")
-
-                # Downloads
-                if ss.vrp_job:
+                # Show VRP JSON
+                if ss.vrp_last:
                     st.download_button(
-                        "⬇️ Download VRP Create JSON",
-                        data=json.dumps(ss.vrp_job, indent=2),
-                        file_name="vrp_create.json",
-                        mime="application/json",
-                        use_container_width=True,
-                    )
-                if ss.vrp_result:
-                    st.download_button(
-                        "⬇️ Download VRP Result JSON",
-                        data=json.dumps(ss.vrp_result, indent=2),
-                        file_name="vrp_result.json",
-                        mime="application/json",
-                        use_container_width=True,
-                    )
-                if ss.directions_after:
-                    st.download_button(
-                        "⬇️ Download Directions (After) JSON",
-                        data=json.dumps(ss.directions_after, indent=2),
-                        file_name="directions_after.json",
+                        "⬇️ Download VRP create JSON",
+                        data=json.dumps(ss.vrp_last, indent=2),
+                        file_name="vrp_create_last.json",
                         mime="application/json",
                         use_container_width=True,
                     )
 
-# ==========================================================
-# TAB 4: DISTANCE MATRIX (NxN)
-# ==========================================================
-with tab_matrix:
-    st.subheader("Distance Matrix (NxN) — supports 20+ points")
-    if len(ss.stops) < 2:
-        st.warning("Need at least 2 stops.")
-    else:
-        coords = [(s["lat"], s["lng"]) for s in ss.stops if s.get("lat") is not None and s.get("lng") is not None]
-        if len(coords) < 2:
-            st.warning("Stops must have lat/lng. Use Geocode tab or generate random lat/lng stops.")
-        else:
-            max_n = min(60, len(coords))
-            n = st.number_input("Use first N stops", min_value=2, max_value=max_n, value=min(20, max_n), step=1)
+                st.markdown("### Step 3 — Recompute Directions (After)")
+                if ss.vrp_last and ss.vrp_last.get("status") == 200:
+                    # Try to extract optimized order.
+                    # Different schemas exist; we handle multiple.
+                    data = ss.vrp_last.get("data") or {}
+                    order_indices = None
 
-            with st.form("dm_form", clear_on_submit=False):
-                run_dm = st.form_submit_button("📏 Compute NxN Distance Matrix", use_container_width=True)
+                    # candidate paths
+                    # e.g., routes[0].steps[*].location_index, or solution.routes[0].jobs, etc.
+                    if isinstance(data, dict):
+                        # 1) solution.routes[0].steps
+                        sol = data.get("solution") or data.get("result") or data
+                        routes = sol.get("routes") if isinstance(sol, dict) else None
+                        if isinstance(routes, list) and routes:
+                            r0 = routes[0]
+                            steps = r0.get("steps") or r0.get("activities") or []
+                            idxs = []
+                            for s in steps:
+                                if "location_index" in s:
+                                    idxs.append(int(s["location_index"]))
+                            if idxs:
+                                order_indices = idxs
 
-            if run_dm:
-                sub = coords[: int(n)]
-                origins = "|".join([latlng_str(a[0], a[1]) for a in sub])
-                destinations = origins
+                        # 2) route with "jobs" list of indices
+                        if order_indices is None:
+                            routes = data.get("routes")
+                            if isinstance(routes, list) and routes:
+                                r0 = routes[0]
+                                jobs = r0.get("jobs") or []
+                                idxs = []
+                                for j in jobs:
+                                    if "location_index" in j:
+                                        idxs.append(int(j["location_index"]))
+                                if idxs:
+                                    order_indices = [0] + idxs + [0]
 
-                params = {
-                    "origins": origins,
-                    "destinations": destinations,
-                    "mode": st.session_state.get("mode", "car"),
-                }
-                if st.session_state.get("avoid"):
-                    params["avoid"] = "|".join(st.session_state["avoid"])
-                if st.session_state.get("traffic") == "Yes":
-                    params["traffic"] = "true"
-                if st.session_state.get("dep", 0):
-                    params["departure_time"] = int(st.session_state["dep"])
+                    if order_indices:
+                        # Build optimized coords (ensure start at 0)
+                        opt_coords = []
+                        for idx in order_indices:
+                            if 0 <= idx < len(coords_use):
+                                opt_coords.append(coords_use[idx])
+                        # if still too short, fallback to original
+                        if len(opt_coords) < 2:
+                            opt_coords = coords_use
 
-                # Distance Matrix API endpoint (product docs list it; common path is /distancematrix/json)
-                status, resp = cached_get("/distancematrix/json", json.dumps(params, sort_keys=True))
-                st.success(f"Distance Matrix: HTTP {status}")
+                        if st.button("🧭 Recompute route (After)", use_container_width=True):
+                            status2, data2 = directions_call(opt_coords)
+                            ss.directions_after = {"status": status2, "data": data2, "ts": time.time(), "coords_used": opt_coords}
 
-                if status != 200:
-                    st.error("Distance Matrix failed.")
-                    st.json(resp)
-                else:
-                    # Parse into dataframe
-                    rows = resp.get("rows", [])
-                    mat_km = []
-                    mat_min = []
-                    for r in rows:
-                        elems = r.get("elements", [])
-                        km_row = []
-                        min_row = []
-                        for e in elems:
-                            d = e.get("distance", {}).get("value")
-                            t = e.get("duration", {}).get("value")
-                            km_row.append(km(float(d)) if d is not None else None)
-                            min_row.append(mins(float(t)) if t is not None else None)
-                        mat_km.append(km_row)
-                        mat_min.append(min_row)
+                    else:
+                        st.info("Optimization succeeded, but route order not found in response schema. (We can still show raw JSON below.)")
 
-                    df_km = pd.DataFrame(mat_km)
-                    df_min = pd.DataFrame(mat_min)
-                    st.markdown("#### Distance (km)")
-                    st.dataframe(df_km, width="stretch")
-                    st.markdown("#### Duration (min)")
-                    st.dataframe(df_min, width="stretch")
+                # Render After map + compare
+                if ss.directions_after and ss.directions_after["status"] == 200 and ss.directions_before and ss.directions_before["status"] == 200:
+                    after_coords = extract_route_coords(ss.directions_after["data"])
+                    after_km, after_min = extract_total_distance_duration(ss.directions_after["data"])
+                    before_km, before_min = extract_total_distance_duration(ss.directions_before["data"])
 
-                    st.download_button(
-                        "⬇️ Download Distance Matrix JSON",
-                        data=json.dumps(resp, indent=2),
-                        file_name="distance_matrix.json",
-                        mime="application/json",
-                        use_container_width=True,
-                    )
-                    st.download_button(
-                        "⬇️ Download Distance (km) CSV",
-                        data=df_km.to_csv(index=False),
-                        file_name="distance_km.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                    st.download_button(
-                        "⬇️ Download Duration (min) CSV",
-                        data=df_min.to_csv(index=False),
-                        file_name="duration_min.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
+                    st.markdown("### Optimized route map (After)")
+                    cu = ss.directions_after.get("coords_used") or coords_use
 
-# ==========================================================
-# TAB 5: SNAP-TO-ROAD + ISOCHRONE
-# ==========================================================
-with tab_snap_iso:
-    st.subheader("Snap-to-road + Isochrone (stable maps)")
+                    mA = base_map(cu[0][0], cu[0][1], zoom=12)
+                    add_numbered_markers(mA, [{"lat": a, "lng": b, "label": f"{i+1}"} for i, (a, b) in enumerate(cu)], color="red")
+                    add_route_polyline_with_arrows(mA, after_coords)
+                    render_map(mA, key="map_route_after", height=520)
 
-    coords = [(s["lat"], s["lng"]) for s in ss.stops if s.get("lat") is not None and s.get("lng") is not None]
-    if len(coords) < 2:
-        st.info("Add at least 2 stops with lat/lng to test Snap-to-road. Isochrone works with center only.")
-    else:
-        # ----- Snap-to-road 
-        st.markdown("### Snap-to-road")
-        max_n = min(60, len(coords))
-        nmax = max(2, max_n)
-        # Fix slider min/max issue:
-        if nmax <= 2:
-            n_path = 2
-            st.info("Only 2 coordinate points available for Snap-to-road path.")
-        else:
-            n_path = st.slider("N points for path (use first N)", min_value=2, max_value=nmax, value=min(10, nmax), step=1)
+                    # Compare metrics
+                    st.markdown("### Comparison")
+                    c1, c2, c3 = st.columns(3)
 
-        with st.form("snap_form", clear_on_submit=False):
-            run_snap = st.form_submit_button("🧲 Snap path to road", use_container_width=True)
+                    def fmt_delta(before, after):
+                        if before is None or after is None:
+                            return None, None
+                        delta = after - before
+                        pct = (delta / before * 100.0) if before else None
+                        return delta, pct
 
-        snap_coords = None
-        if run_snap:
-            path_pts = coords[: int(n_path)]
-            path = "|".join([latlng_str(a[0], a[1]) for a in path_pts])
-            params = {"path": path}
-            status, resp = cached_get("/snapToRoads/json", json.dumps(params, sort_keys=True))
-            st.success(f"Snap-to-road: HTTP {status}")
+                    if before_km is not None and after_km is not None:
+                        d, p = fmt_delta(before_km, after_km)
+                        c1.metric("Distance (km) After", f"{after_km:.2f}", delta=f"{d:+.2f} km" if d is not None else None)
+                        if p is not None:
+                            c1.caption(f"% change: {p:+.1f}%")
+                    if before_min is not None and after_min is not None:
+                        d, p = fmt_delta(before_min, after_min)
+                        c2.metric("Duration (min) After", f"{after_min:.1f}", delta=f"{d:+.1f} min" if d is not None else None)
+                        if p is not None:
+                            c2.caption(f"% change: {p:+.1f}%")
 
-            if status != 200:
-                st.error("Snap-to-road failed.")
-                st.json(resp)
-            else:
-                # Response commonly includes snappedPoints or geometry; handle both
-                snapped = []
-                if "snappedPoints" in resp and isinstance(resp["snappedPoints"], list):
-                    for p in resp["snappedPoints"]:
-                        loc = p.get("location", {})
-                        lat = loc.get("latitude")
-                        lng = loc.get("longitude")
-                        if lat is not None and lng is not None:
-                            snapped.append((float(lat), float(lng)))
-                elif "coordinates" in resp:
-                    # if GeoJSON-like [lng,lat]
-                    try:
-                        snapped = [(c[1], c[0]) for c in resp["coordinates"]]
-                    except Exception:
-                        snapped = []
+                    if (before_km is not None and after_km is not None) and (before_min is not None and after_min is not None):
+                        saved_km = before_km - after_km
+                        saved_min = before_min - after_min
+                        c3.metric("Saved (km)", f"{saved_km:.2f}")
+                        c3.metric("Saved (min)", f"{saved_min:.1f}")
 
-                snap_coords = snapped if len(snapped) >= 2 else None
-                ss.map_versions["snap"] += 1
-
+        # Downloads
+        st.divider()
+        dl1, dl2, dl3 = st.columns(3)
+        with dl1:
+            if ss.directions_before:
                 st.download_button(
-                    "⬇️ Download Snap-to-road JSON",
-                    data=json.dumps(resp, indent=2),
-                    file_name="snap_to_road.json",
+                    "⬇️ Download Directions (Before)",
+                    data=json.dumps(ss.directions_before, indent=2),
+                    file_name="directions_before.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+        with dl2:
+            if ss.vrp_last:
+                st.download_button(
+                    "⬇️ Download VRP (Create/Result)",
+                    data=json.dumps(ss.vrp_last, indent=2),
+                    file_name="vrp_last.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+        with dl3:
+            if ss.directions_after:
+                st.download_button(
+                    "⬇️ Download Directions (After)",
+                    data=json.dumps(ss.directions_after, indent=2),
+                    file_name="directions_after.json",
                     mime="application/json",
                     use_container_width=True,
                 )
 
-        m_snap = build_map(center=ss.center, stops=ss.stops[: int(min(20, len(ss.stops)))], route_coords=snap_coords, route_color="#6A1B9A", zoom=11)
-        st_folium(m_snap, height=520, width="stretch", key=f"map_snap_{ss.map_versions['snap']}")
+# =============================
+# TAB 4 — DISTANCE MATRIX (NxN)
+# =============================
+with tabs[3]:
+    st.subheader("Distance Matrix (NxN) — supports 20+ points")
 
-    st.divider()
+    df = parse_stops_df()
+    valid = df.dropna(subset=["lat", "lng"]).reset_index(drop=True)
 
-    # ----- Isochrone :contentReference[oaicite:14]{index=14}
-    st.markdown("### Isochrone")
-    with st.form("iso_form", clear_on_submit=False):
-        iso_mode = st.selectbox("Mode", TRAVEL_MODES, index=0, key="iso_mode")
-        iso_type = st.selectbox("Range type", ["time", "distance"], index=0)
-        iso_val = st.number_input("Range value (seconds if time, meters if distance)", min_value=60, value=900, step=60)
-        iso_btn = st.form_submit_button("🟦 Compute isochrone", use_container_width=True)
+    if len(valid) < 2:
+        st.warning("Need at least 2 stops with lat/lng.")
+    else:
+        max_points = min(60, len(valid))
+        n = st.number_input("How many stops to include", min_value=2, max_value=max_points, value=min(20, max_points))
 
-    iso_geojson = None
-    if iso_btn:
-        # Isochrone endpoint: /isochrone/json :contentReference[oaicite:15]{index=15}
-        params = {
-            "mode": iso_mode,
-            "lat": ss.center[0],
-            "lng": ss.center[1],
-        }
-        if iso_type == "time":
-            params["range_type"] = "time"
-            params["range"] = int(iso_val)
-        else:
-            params["range_type"] = "distance"
-            params["range"] = int(iso_val)
+        if st.button("📏 Compute Distance Matrix", use_container_width=True):
+            subset = valid.iloc[:n]
+            locs = [normalize_latlng_str(float(r["lat"]), float(r["lng"])) for _, r in subset.iterrows()]
+            # common matrix API uses origins & destinations
+            params = {
+                "origins": "|".join(locs),
+                "destinations": "|".join(locs),
+                "mode": ss.global_opts["mode"],
+                "units": ss.global_opts["units"],
+            }
+            if ss.global_opts["traffic"]:
+                params["traffic"] = "true"
+            if ss.global_opts["departure_time"]:
+                params["departure_time"] = int(ss.global_opts["departure_time"])
+            if ss.global_opts["avoid"]:
+                params["avoid"] = ",".join(ss.global_opts["avoid"])
 
-        status, resp = cached_get("/isochrone/json", json.dumps(params, sort_keys=True))
-        st.success(f"Isochrone: HTTP {status}")
-        if status != 200:
-            st.error("Isochrone failed.")
-            st.json(resp)
-        else:
-            # Expect GeoJSON-ish polygons
-            iso_geojson = resp.get("features") or resp.get("polygons") or resp
-            ss.map_versions["iso"] += 1
+            status, data = http_get("/distancematrix", params=params, timeout=60)
+            if status == 404:
+                status, data = http_get("/distance_matrix", params=params, timeout=60)
+
+            ss.dm_last = {"status": status, "data": data, "ts": time.time(), "params": params}
+
+        if ss.dm_last:
+            st.caption(f"Distance Matrix: HTTP {ss.dm_last['status']}")
             st.download_button(
-                "⬇️ Download Isochrone JSON",
-                data=json.dumps(resp, indent=2),
-                file_name="isochrone.json",
+                "⬇️ Download Distance Matrix JSON",
+                data=json.dumps(ss.dm_last, indent=2),
+                file_name="distance_matrix_last.json",
                 mime="application/json",
                 use_container_width=True,
             )
-
-    # Render isochrone map persistently
-    m_iso = folium.Map(location=list(ss.center), zoom_start=11, control_scale=True)
-    folium.Marker(list(ss.center), tooltip="Center", icon=folium.Icon(color="red")).add_to(m_iso)
-    if iso_geojson:
-        try:
-            # If it's full feature collection
-            if isinstance(iso_geojson, dict) and iso_geojson.get("type") == "FeatureCollection":
-                folium.GeoJson(iso_geojson).add_to(m_iso)
-            # If list of features
-            elif isinstance(iso_geojson, list):
-                folium.GeoJson({"type": "FeatureCollection", "features": iso_geojson}).add_to(m_iso)
-            # Else try as-is
+            # Try render a table if the schema matches common patterns
+            data = ss.dm_last.get("data") or {}
+            rows = data.get("rows")
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict) and "elements" in rows[0]:
+                mat = []
+                for r in rows:
+                    elems = r.get("elements") or []
+                    mat.append([e.get("distance", {}).get("value") for e in elems])
+                dfm = pd.DataFrame(mat)
+                st.dataframe(dfm, width="stretch", height=320)
             else:
-                folium.GeoJson(iso_geojson).add_to(m_iso)
-        except Exception:
-            pass
-    plugins.Fullscreen().add_to(m_iso)
-    st_folium(m_iso, height=520, width="stretch", key=f"map_iso_{ss.map_versions['iso']}")
+                st.json(data)
+
+# =============================
+# TAB 5 — SNAP TO ROAD + ISOCHRONE
+# =============================
+with tabs[4]:
+    st.subheader("Snap-to-Road + Isochrone (stable outputs)")
+
+    df = parse_stops_df()
+    valid = df.dropna(subset=["lat", "lng"]).reset_index(drop=True)
+
+    st.markdown("### Snap-to-Road")
+    st.caption("Pick a path from your current stops; output stays visible after button click.")
+
+    if len(valid) < 2:
+        st.warning("Need at least 2 stops with lat/lng.")
+    else:
+        max_points = min(50, len(valid))
+        n_path = st.number_input("N stops for path", min_value=2, max_value=max_points, value=min(10, max_points))
+        subset = valid.iloc[:n_path]
+        path = [normalize_latlng_str(float(r["lat"]), float(r["lng"])) for _, r in subset.iterrows()]
+
+        if st.button("🧷 Snap path to road", use_container_width=True):
+            # Many snap-to-road APIs accept path as "path=lat,lng|lat,lng"
+            params = {"path": "|".join(path)}
+            status, data = http_get("/snapToRoad", params=params, timeout=60)
+            if status == 404:
+                status, data = http_get("/snap-to-road", params=params, timeout=60)
+            ss.snap_last = {"status": status, "data": data, "ts": time.time(), "params": params}
+
+    if ss.snap_last:
+        st.caption(f"Snap-to-Road: HTTP {ss.snap_last['status']}")
+        st.download_button(
+            "⬇️ Download Snap-to-Road JSON",
+            data=json.dumps(ss.snap_last, indent=2),
+            file_name="snap_to_road_last.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        # Render snapped polyline if available
+        d = ss.snap_last.get("data") or {}
+        snapped_coords = []
+        if isinstance(d.get("geometry"), str):
+            snapped_coords = decode_polyline(d["geometry"], precision=5)
+        elif isinstance(d.get("snappedPoints"), list):
+            for p in d["snappedPoints"]:
+                loc = p.get("location") or p.get("position") or {}
+                if "latitude" in loc and "longitude" in loc:
+                    snapped_coords.append((float(loc["latitude"]), float(loc["longitude"])))
+                elif "lat" in loc and "lng" in loc:
+                    snapped_coords.append((float(loc["lat"]), float(loc["lng"])))
+
+        if snapped_coords:
+            mS = base_map(snapped_coords[0][0], snapped_coords[0][1], zoom=13)
+            add_route_polyline_with_arrows(mS, snapped_coords)
+            render_map(mS, key="map_snap", height=420)
+        else:
+            st.json(d)
+
+    st.divider()
+    st.markdown("### Isochrone")
+    st.caption("Compute reachable area from the current center; output stays visible after button click.")
+
+    iso_col1, iso_col2, iso_col3 = st.columns([1, 1, 1])
+    with iso_col1:
+        iso_minutes = st.selectbox("Range (minutes)", [5, 10, 15, 20, 30, 45, 60], index=2)
+    with iso_col2:
+        iso_type = st.selectbox("Type", ["time", "distance"], index=0)
+    with iso_col3:
+        iso_mode = st.selectbox("Mode", ["car", "truck", "bike", "walk"], index=0)
+
+    if st.button("🟦 Compute Isochrone", use_container_width=True):
+        center = normalize_latlng_str(ss.center["lat"], ss.center["lng"])
+        params = {
+            "location": center,
+            "mode": iso_mode,
+        }
+        if iso_type == "time":
+            params["range"] = iso_minutes * 60
+        else:
+            params["range"] = iso_minutes * 1000
+
+        status, data = http_get("/isochrone", params=params, timeout=60)
+        if status == 404:
+            status, data = http_get("/isoline", params=params, timeout=60)
+        ss.iso_last = {"status": status, "data": data, "ts": time.time(), "params": params}
+
+    if ss.iso_last:
+        st.caption(f"Isochrone: HTTP {ss.iso_last['status']}")
+        st.download_button(
+            "⬇️ Download Isochrone JSON",
+            data=json.dumps(ss.iso_last, indent=2),
+            file_name="isochrone_last.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        d = ss.iso_last.get("data") or {}
+        # If GeoJSON present, draw it
+        gj = d.get("geojson") or d.get("data") or None
+        if isinstance(gj, dict) and gj.get("type") in ("Feature", "FeatureCollection"):
+            mI = base_map(ss.center["lat"], ss.center["lng"], zoom=12)
+            folium.GeoJson(gj).add_to(mI)
+            render_map(mI, key="map_iso", height=420)
+        else:
+            st.json(d)
