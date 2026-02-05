@@ -163,55 +163,60 @@ def extract_places_items(resp: Any) -> List[Dict[str, Any]]:
     return extract_geocode_candidates(resp)
 
 def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, float]]:
-    """
-    Correct Google encoded polyline decoder.
-    Your previous version used result=1 (bug) → geometry decode fails → no route line/arrows.
-    """
     if not isinstance(polyline_str, str):
         return []
-    s = polyline_str.strip()
-    if not s:
+    polyline_str = polyline_str.strip()
+    if not polyline_str:
         return []
 
-    index = 0
-    lat = 0
-    lng = 0
-    coordinates: List[Tuple[float, float]] = []
-    factor = 10 ** precision
-    length = len(s)
+    def _decode(prec: int) -> List[Tuple[float, float]]:
+        index = 0
+        lat = 0
+        lng = 0
+        coordinates: List[Tuple[float, float]] = []
+        factor = 10 ** prec
+        length = len(polyline_str)
 
-    try:
         while index < length:
-            result = 0
+            result = 1
             shift = 0
             while True:
-                b = ord(s[index]) - 63
+                b = ord(polyline_str[index]) - 63
                 index += 1
-                result |= (b & 0x1F) << shift
+                result += b << shift
                 shift += 5
-                if b < 0x20:
+                if b < 0x1F:
                     break
-            dlat = ~(result >> 1) if (result & 1) else (result >> 1)
-            lat += dlat
+            delta_lat = ~(result >> 1) if (result & 1) else (result >> 1)
+            lat += delta_lat
 
-            result = 0
+            result = 1
             shift = 0
             while True:
-                b = ord(s[index]) - 63
+                b = ord(polyline_str[index]) - 63
                 index += 1
-                result |= (b & 0x1F) << shift
+                result += b << shift
                 shift += 5
-                if b < 0x20:
+                if b < 0x1F:
                     break
-            dlng = ~(result >> 1) if (result & 1) else (result >> 1)
-            lng += dlng
+            delta_lng = ~(result >> 1) if (result & 1) else (result >> 1)
+            lng += delta_lng
 
             coordinates.append((lat / factor, lng / factor))
-    except Exception:
-        # If a provider uses a different precision or malformed polyline, avoid crashing UI.
-        return []
 
-    return coordinates
+        return coordinates
+
+    # Try precision=6 first (common in modern routing responses), then fallback to 5
+    pts6 = _decode(6)
+    if pts6 and all(-90 <= p[0] <= 90 and -180 <= p[1] <= 180 for p in pts6):
+        return pts6
+
+    pts5 = _decode(5)
+    if pts5 and all(-90 <= p[0] <= 90 and -180 <= p[1] <= 180 for p in pts5):
+        return pts5
+
+    # If both look bad, return the safer one (shorter tends to be less exploded)
+    return pts6 if len(pts6) < len(pts5) else pts5    
 
 def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
     if not isinstance(resp, dict):
@@ -454,33 +459,41 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any])
 
 def vrp_create_v2(stops: pd.DataFrame, objective: str) -> Tuple[int, Any]:
     """
-    IMPORTANT FIX:
-    Optimization v2 expects:
-      locations: { id: "...", location: ["lat,lng", ...] }
-    NOT locations: [ {id, location}, ... ]
-    This is why you were getting: locations.location is missing
+    VRP v2 payload fix:
+      - locations is an OBJECT with a `location` list
+      - each location should be LngLatLike (use [lng, lat] numbers)
+      - jobs reference location_index
+      - vehicles use start_location_index / end_location_index (matches your 400 payload pattern)
     """
     if len(stops) < 2:
         return 0, {"error": "Need at least 2 stops"}
 
-    df = stops.reset_index(drop=True).copy()
-    if df["lat"].isna().any() or df["lng"].isna().any():
-        return 0, {"error": "Some stops are missing lat/lng. Geocode first (Tab 1) or paste lat,lng stops."}
-
-    loc_list = [latlng_str(float(r["lat"]), float(r["lng"])) for _, r in df.iterrows()]
+    # Build LngLatLike points: [lng, lat]
+    pts = []
+    for r in stops.reset_index(drop=True).itertuples():
+        pts.append([float(r.lng), float(r.lat)])
 
     body = {
         "locations": {
-            "id": "locs_1",
-            "location": loc_list,
+            "id": 0,
+            "location": pts
         },
-        "jobs": [{"id": int(i), "location_index": int(i)} for i in range(len(loc_list))],
-        "vehicles": [{"id": "vehicle_1", "start_index": 0, "end_index": 0}],
-        "options": {"objective": {"travel_cost": objective}},  # distance | duration
+        "jobs": [{"id": i, "location_index": i} for i in range(len(pts))],
+        "vehicles": [{
+            "id": 0,
+            "start_location_index": 0,
+            "end_location_index": 0
+        }],
+        "options": {
+            # keep your existing objective concept, but in the format you were already using
+            # (if your deployment expects a different objective object, we can adapt after seeing the 200/400 response)
+            "objective": {"travel_cost": objective}  # "distance" | "duration"
+        }
     }
 
     params = {"key": NB_API_KEY}
     status, data = nb_post("/optimization/v2", params=params, body=body)
+
     st.session_state.last_json["vrp_create_payload"] = body
     st.session_state.last_json["vrp_create_response"] = data
     return status, data
