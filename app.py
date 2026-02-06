@@ -1,12 +1,11 @@
 # app.py
 # NextBillion.ai — Visual API Tester (stable maps + 20+ stops + before/after optimize)
 # Fixes:
-# - Directions distance/time = 0.00 -> now computed from Directions response (with safe fallbacks)
-# - VRP v2 "locations.location missing" -> auto-tries two request-body formats (schema varies by deployment)
-# - Snap-to-Road -> uses /snapToRoads/json (GET/POST) with path + geometry=geojson + mode
-# - Isochrone -> uses documented GET-style params and draws polygon/geojson on map
-# - Polyline decode hardened (prevents IndexError)
-# - Global options applied consistently
+# - Directions distance/time showing 0 (now parsed from directions route)
+# - VRP v2 "locations.location missing" (now builds correct schema + auto-normalizes common wrong schemas)
+# - Isochrone (correct GET /isochrone/json + draws polygon)
+# - Snap-to-roads (correct /snapToRoads/json + draws snapped geometry)
+# - Polyline decode IndexError (hardened decoder)
 #
 # Run: streamlit run app.py
 
@@ -27,7 +26,6 @@ import folium
 from folium.plugins import PolyLineTextPath
 from streamlit_folium import st_folium
 
-
 # -----------------------------
 # CONFIG
 # -----------------------------
@@ -36,7 +34,6 @@ NB_BASE = "https://api.nextbillion.io"
 
 st.set_page_config(page_title="NextBillion.ai — Visual API Tester", layout="wide")
 YESNO = ["No", "Yes"]
-
 
 # -----------------------------
 # HELPERS
@@ -69,21 +66,27 @@ def unique_key(prefix: str) -> str:
     st.session_state["_key_seq"] = st.session_state.get("_key_seq", 0) + 1
     return f"{prefix}_{st.session_state['_key_seq']}"
 
-def safe_get(d: Any, path: List[Union[str, int]], default=None):
-    """Safe nested getter for dict/list."""
-    cur = d
+def safe_json_loads(s: str) -> Optional[Any]:
     try:
-        for p in path:
+        if not s or not str(s).strip():
+            return None
+        return json.loads(s)
+    except Exception:
+        return None
+
+def deep_get(d: Any, path: List[Union[str, int]], default=None):
+    cur = d
+    for p in path:
+        try:
             if isinstance(p, int) and isinstance(cur, list) and 0 <= p < len(cur):
                 cur = cur[p]
             elif isinstance(p, str) and isinstance(cur, dict) and p in cur:
                 cur = cur[p]
             else:
                 return default
-        return cur
-    except Exception:
-        return default
-
+        except Exception:
+            return default
+    return cur
 
 # -----------------------------
 # HTTP (button-only + caching)
@@ -95,9 +98,9 @@ class ReqSig:
     params_json: str
     body_json: str
 
-def _sig(method: str, url: str, params: Dict[str, Any] | None, body: Dict[str, Any] | None) -> ReqSig:
+def _sig(method: str, url: str, params: Dict[str, Any] | None, body: Any | None) -> ReqSig:
     pj = json.dumps(params or {}, sort_keys=True, separators=(",", ":"))
-    bj = json.dumps(body or {}, sort_keys=True, separators=(",", ":"))
+    bj = json.dumps(body if body is not None else {}, sort_keys=True, separators=(",", ":"))
     return ReqSig(method=method.upper(), url=url, params_json=pj, body_json=bj)
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -105,22 +108,19 @@ def _cached_request(sig: ReqSig) -> Tuple[int, Any]:
     method = sig.method
     url = sig.url
     params = json.loads(sig.params_json)
-    body = json.loads(sig.body_json) if sig.body_json else None
+    body = json.loads(sig.body_json)
 
     try:
         if method == "GET":
-            r = requests.get(url, params=params, timeout=60)
+            r = requests.get(url, params=params, timeout=90)
         else:
-            r = requests.post(url, params=params, json=body, timeout=60)
+            # for POST/PUT
+            r = requests.post(url, params=params, json=body, timeout=90)
 
-        ct = (r.headers.get("content-type") or "").lower()
+        ct = r.headers.get("content-type", "")
         if "application/json" in ct:
             return r.status_code, r.json()
-        # sometimes APIs return json with text/plain
-        try:
-            return r.status_code, r.json()
-        except Exception:
-            return r.status_code, r.text
+        return r.status_code, r.text
     except Exception as e:
         return 0, {"error": str(e)}
 
@@ -129,11 +129,10 @@ def nb_get(path: str, params: Dict[str, Any]) -> Tuple[int, Any]:
     sig = _sig("GET", url, params=params, body=None)
     return _cached_request(sig)
 
-def nb_post(path: str, params: Dict[str, Any], body: Dict[str, Any]) -> Tuple[int, Any]:
+def nb_post(path: str, params: Dict[str, Any], body: Any) -> Tuple[int, Any]:
     url = NB_BASE + path
     sig = _sig("POST", url, params=params, body=body)
     return _cached_request(sig)
-
 
 # -----------------------------
 # PARSERS (robust)
@@ -189,11 +188,11 @@ def extract_places_items(resp: Any) -> List[Dict[str, Any]]:
     return extract_geocode_candidates(resp)
 
 def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, float]]:
-    """Google encoded polyline decoder (hardened)."""
+    # Hardened: never crash on malformed strings
     if not isinstance(polyline_str, str):
         return []
-    s = polyline_str.strip()
-    if not s:
+    polyline_str = polyline_str.strip()
+    if not polyline_str:
         return []
 
     index = 0
@@ -201,42 +200,37 @@ def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, 
     lng = 0
     coordinates: List[Tuple[float, float]] = []
     factor = 10 ** precision
-    length = len(s)
+    length = len(polyline_str)
 
-    try:
-        while index < length:
-            result = 0
-            shift = 0
-            while True:
-                if index >= length:
-                    return coordinates
-                b = ord(s[index]) - 63
-                index += 1
-                result |= (b & 0x1F) << shift
-                shift += 5
-                if b < 0x20:
-                    break
-            delta_lat = ~(result >> 1) if (result & 1) else (result >> 1)
-            lat += delta_lat
+    def read_value() -> Optional[int]:
+        nonlocal index
+        result = 0
+        shift = 0
+        while True:
+            if index >= length:
+                return None
+            b = ord(polyline_str[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        return result
 
-            result = 0
-            shift = 0
-            while True:
-                if index >= length:
-                    return coordinates
-                b = ord(s[index]) - 63
-                index += 1
-                result |= (b & 0x1F) << shift
-                shift += 5
-                if b < 0x20:
-                    break
-            delta_lng = ~(result >> 1) if (result & 1) else (result >> 1)
-            lng += delta_lng
+    while index < length:
+        r1 = read_value()
+        if r1 is None:
+            break
+        delta_lat = ~(r1 >> 1) if (r1 & 1) else (r1 >> 1)
+        lat += delta_lat
 
-            coordinates.append((lat / factor, lng / factor))
-    except Exception:
-        # if polyline is malformed, return what we decoded so far
-        return coordinates
+        r2 = read_value()
+        if r2 is None:
+            break
+        delta_lng = ~(r2 >> 1) if (r2 & 1) else (r2 >> 1)
+        lng += delta_lng
+
+        coordinates.append((lat / factor, lng / factor))
 
     return coordinates
 
@@ -244,8 +238,8 @@ def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
     if not isinstance(resp, dict):
         return []
 
-    # GeoJSON FeatureCollection LineString
-    if resp.get("type") == "FeatureCollection" and isinstance(resp.get("features"), list):
+    # GeoJSON LineString
+    if resp.get("type") == "FeatureCollection" and "features" in resp:
         for f in resp["features"]:
             geom = (f or {}).get("geometry") or {}
             if geom.get("type") == "LineString":
@@ -263,117 +257,170 @@ def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
     routes = resp.get("routes") or resp.get("route") or []
     if isinstance(routes, dict):
         routes = [routes]
-    if not routes or not isinstance(routes, list):
+    if not routes:
         return []
 
     r0 = routes[0] if isinstance(routes[0], dict) else {}
 
-    poly = r0.get("geometry") or r0.get("polyline") or safe_get(r0, ["overview_polyline", "points"])
+    # Try common polyline keys
+    poly = r0.get("geometry") or r0.get("polyline") or deep_get(r0, ["overview_polyline", "points"])
     if isinstance(poly, str) and poly.strip():
-        # try both polyline5 and polyline6; keep the longer non-empty
-        pts5 = decode_polyline(poly, precision=5)
+        # try polyline6 first; fallback to 5
         pts6 = decode_polyline(poly, precision=6)
-        if pts6 and len(pts6) >= len(pts5):
+        if pts6:
             return pts6
-        return pts5
+        pts5 = decode_polyline(poly, precision=5)
+        if pts5:
+            return pts5
 
-    # geometry as list of points
-    geom = r0.get("geometry")
-    if isinstance(geom, list):
-        pts = []
-        for p in geom:
-            if isinstance(p, dict):
-                lat_f, lng_f = normalize_latlng(p.get("lat"), p.get("lng"))
-                if lat_f is not None:
-                    pts.append((lat_f, lng_f))
-            elif isinstance(p, list) and len(p) >= 2:
-                lat_f, lng_f = normalize_latlng(p[0], p[1])
-                if lat_f is not None:
-                    pts.append((lat_f, lng_f))
-        if pts:
-            return pts
-
-    # legs / steps geometry
+    # legs / steps geometry (polyline per step)
     legs = r0.get("legs") or []
     if isinstance(legs, dict):
         legs = [legs]
     pts2: List[Tuple[float, float]] = []
-    for leg in legs if isinstance(legs, list) else []:
+    for leg in legs:
         steps = (leg or {}).get("steps") or []
         for stp in steps:
             g = (stp or {}).get("geometry")
             if isinstance(g, str) and g.strip():
-                # try both
-                pts5 = decode_polyline(g, precision=5)
-                pts6 = decode_polyline(g, precision=6)
-                pts2.extend(pts6 if (pts6 and len(pts6) >= len(pts5)) else pts5)
+                pts2.extend(decode_polyline(g, precision=6) or decode_polyline(g, precision=5))
     return pts2
 
-def extract_directions_totals(resp: Any) -> Tuple[Optional[float], Optional[float]]:
+def extract_route_totals(resp: Any) -> Tuple[Optional[float], Optional[float]]:
     """
-    Returns (distance_m, duration_s) from Directions response.
-    Handles several shapes:
-      routes[0].distance (number OR {"value":...})
-      routes[0].duration (number OR {"value":...})
-      else sums legs[*].distance.value + legs[*].duration.value
+    Returns (distance_m, duration_s) from directions response if present.
     """
     if not isinstance(resp, dict):
         return None, None
-
-    r0 = safe_get(resp, ["routes", 0], default=None)
-    if not isinstance(r0, dict):
-        # sometimes resp has "route" single object
-        r0 = resp.get("route") if isinstance(resp.get("route"), dict) else None
-    if not isinstance(r0, dict):
+    routes = resp.get("routes") or resp.get("route") or []
+    if isinstance(routes, dict):
+        routes = [routes]
+    if not routes or not isinstance(routes, list) or not isinstance(routes[0], dict):
         return None, None
+    r0 = routes[0]
+    dist = r0.get("distance") or deep_get(r0, ["summary", "distance"])
+    dur = r0.get("duration") or deep_get(r0, ["summary", "duration"])
+    try:
+        dist_m = float(dist) if dist is not None else None
+    except Exception:
+        dist_m = None
+    try:
+        dur_s = float(dur) if dur is not None else None
+    except Exception:
+        dur_s = None
+    return dist_m, dur_s
 
-    dist = r0.get("distance")
-    dur = r0.get("duration")
+def extract_matrix_pairs_totals(data_m: Any) -> Tuple[float, float]:
+    """
+    Matrix pairs call: rows[i].elements[0].distance.value (m), duration.value (s)
+    """
+    dist_total = 0.0
+    dur_total = 0.0
+    if not isinstance(data_m, dict):
+        return dist_total, dur_total
 
-    def to_num(x):
-        if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            return float(x)
-        if isinstance(x, dict):
-            v = x.get("value")
-            if isinstance(v, (int, float, str)):
-                try:
-                    return float(v)
-                except Exception:
-                    return None
-        return None
+    rows = data_m.get("rows") or []
+    for row in rows:
+        elems = (row or {}).get("elements") or []
+        if not elems:
+            continue
+        e0 = elems[0]
+        # Some schemas return numeric directly; prefer .value if dict
+        d = e0.get("distance")
+        t = e0.get("duration")
+        if isinstance(d, dict):
+            dist_total += float(d.get("value") or 0)
+        else:
+            dist_total += float(d or 0)
 
-    dist_m = to_num(dist)
-    dur_s = to_num(dur)
+        if isinstance(t, dict):
+            dur_total += float(t.get("value") or 0)
+        else:
+            dur_total += float(t or 0)
 
-    if dist_m is not None or dur_s is not None:
-        return dist_m, dur_s
+    return dist_total, dur_total
 
-    # sum legs
-    legs = r0.get("legs")
-    if isinstance(legs, dict):
-        legs = [legs]
-    if isinstance(legs, list):
-        dist_sum = 0.0
-        dur_sum = 0.0
-        found = False
-        for leg in legs:
-            if not isinstance(leg, dict):
-                continue
-            d = to_num(leg.get("distance")) or to_num(safe_get(leg, ["distance", "value"])) or to_num(safe_get(leg, ["distance", "meters"]))
-            t = to_num(leg.get("duration")) or to_num(safe_get(leg, ["duration", "value"])) or to_num(safe_get(leg, ["duration", "seconds"]))
-            if d is not None:
-                dist_sum += float(d)
-                found = True
-            if t is not None:
-                dur_sum += float(t)
-                found = True
-        if found:
-            return dist_sum if dist_sum > 0 else None, dur_sum if dur_sum > 0 else None
+def extract_geojson_polygons(resp: Any) -> List[List[Tuple[float, float]]]:
+    """
+    For Isochrone GeoJSON FeatureCollection: polygons are [ [ [lng,lat], ... ] ]
+    Return list of rings as lat,lng tuples (outer rings).
+    """
+    rings: List[List[Tuple[float, float]]] = []
+    if not isinstance(resp, dict):
+        return rings
+    if resp.get("type") != "FeatureCollection":
+        return rings
+    feats = resp.get("features") or []
+    for f in feats:
+        geom = (f or {}).get("geometry") or {}
+        gtype = geom.get("type")
+        coords = geom.get("coordinates")
+        if gtype == "Polygon" and isinstance(coords, list) and coords:
+            # coords[0] is outer ring
+            outer = coords[0]
+            ring: List[Tuple[float, float]] = []
+            for p in outer:
+                if isinstance(p, list) and len(p) >= 2:
+                    lng, lat = p[0], p[1]
+                    lat_f, lng_f = normalize_latlng(lat, lng)
+                    if lat_f is not None:
+                        ring.append((lat_f, lng_f))
+            if ring:
+                rings.append(ring)
+        elif gtype == "MultiPolygon" and isinstance(coords, list):
+            for poly in coords:
+                if isinstance(poly, list) and poly:
+                    outer = poly[0]
+                    ring: List[Tuple[float, float]] = []
+                    for p in outer:
+                        if isinstance(p, list) and len(p) >= 2:
+                            lng, lat = p[0], p[1]
+                            lat_f, lng_f = normalize_latlng(lat, lng)
+                            if lat_f is not None:
+                                ring.append((lat_f, lng_f))
+                    if ring:
+                        rings.append(ring)
+    return rings
 
-    return None, None
+def extract_snap_geometry(resp: Any) -> List[Tuple[float, float]]:
+    """
+    Snap-to-roads returns GeoJSON sometimes in `geometry` or `snappedPoints`.
+    We'll support:
+    - FeatureCollection LineString
+    - {"geometry": {"type":"LineString","coordinates":[[lng,lat],...]}}
+    - {"snappedPoints":[{"location":{"latitude":..,"longitude":..}}, ...]}
+    """
+    if not isinstance(resp, dict):
+        return []
 
+    # FeatureCollection
+    if resp.get("type") == "FeatureCollection":
+        return extract_route_geometry(resp)
+
+    geom = resp.get("geometry")
+    if isinstance(geom, dict) and geom.get("type") == "LineString":
+        pts = []
+        for c in geom.get("coordinates") or []:
+            if isinstance(c, list) and len(c) >= 2:
+                lng, lat = c[0], c[1]
+                lat_f, lng_f = normalize_latlng(lat, lng)
+                if lat_f is not None:
+                    pts.append((lat_f, lng_f))
+        return pts
+
+    snapped = resp.get("snappedPoints") or resp.get("snapped_points")
+    if isinstance(snapped, list):
+        pts = []
+        for sp in snapped:
+            loc = (sp or {}).get("location") or {}
+            lat = loc.get("latitude") or loc.get("lat")
+            lng = loc.get("longitude") or loc.get("lng")
+            lat_f, lng_f = normalize_latlng(lat, lng)
+            if lat_f is not None:
+                pts.append((lat_f, lng_f))
+        return pts
+
+    return []
 
 # -----------------------------
 # MAP RENDERING (stable)
@@ -383,12 +430,12 @@ def make_map(
     stops: pd.DataFrame,
     route_pts: Optional[List[Tuple[float, float]]] = None,
     clicked: Optional[Tuple[float, float]] = None,
-    isochrone_geojson: Optional[Dict[str, Any]] = None,
+    polygons: Optional[List[List[Tuple[float, float]]]] = None,
     zoom: int = 12,
 ) -> folium.Map:
     m = folium.Map(location=[center[0], center[1]], zoom_start=zoom, control_scale=True, tiles="OpenStreetMap")
 
-    # Click marker
+    # Click marker (red)
     if clicked is not None:
         folium.Marker(
             location=[clicked[0], clicked[1]],
@@ -396,8 +443,8 @@ def make_map(
             icon=folium.Icon(color="red", icon="map-pin", prefix="fa"),
         ).add_to(m)
 
-    # Stops numbered
-    for i, row in stops.iterrows():
+    # Stops (numbered)
+    for i, row in stops.reset_index(drop=True).iterrows():
         lat = row.get("lat")
         lng = row.get("lng")
         if pd.isna(lat) or pd.isna(lng):
@@ -418,18 +465,22 @@ def make_map(
             ),
         ).add_to(m)
 
-    # Isochrone polygon/geojson
-    if isinstance(isochrone_geojson, dict):
-        try:
-            folium.GeoJson(isochrone_geojson, name="Isochrone").add_to(m)
-        except Exception:
-            pass
+    # Polygons (Isochrone)
+    if polygons:
+        for ring in polygons:
+            folium.Polygon(
+                locations=ring,
+                weight=3,
+                opacity=0.8,
+                fill=True,
+                fill_opacity=0.2,
+            ).add_to(m)
 
-    # Route polyline + arrows
+    # Route polyline + arrow
     if route_pts:
-        folium.PolyLine(route_pts, weight=5, opacity=0.85).add_to(m)
+        folium.PolyLine(route_pts, weight=5, opacity=0.8).add_to(m)
         try:
-            pl = folium.PolyLine(route_pts, weight=0, opacity=0)
+            pl = folium.PolyLine(route_pts, weight=0, opacity=0)  # invisible base for arrows
             pl.add_to(m)
             PolyLineTextPath(pl, "  ➤  ", repeat=True, offset=7, attributes={"font-size": "14", "fill": "black"}).add_to(m)
         except Exception:
@@ -438,14 +489,12 @@ def make_map(
         # fit bounds
         lats = [p[0] for p in route_pts]
         lngs = [p[1] for p in route_pts]
-        if lats and lngs:
-            m.fit_bounds([[min(lats), min(lngs)], [max(lats), max(lngs)]])
+        m.fit_bounds([[min(lats), min(lngs)], [max(lats), max(lngs)]])
 
     return m
 
 def render_map(m: folium.Map, key: str) -> Dict[str, Any]:
     return st_folium(m, height=520, width="stretch", key=key)
-
 
 # -----------------------------
 # STATE
@@ -455,7 +504,7 @@ def ensure_state():
     if "center" not in ss:
         ss.center = {"lat": 28.6139, "lng": 77.2090, "country": "IND"}  # default Delhi
     if "clicked_pin" not in ss:
-        ss.clicked_pin = None
+        ss.clicked_pin = None  # (lat,lng)
     if "stops_df" not in ss:
         ss.stops_df = pd.DataFrame(columns=["label", "address", "lat", "lng", "source"])
     if "mapsig" not in ss:
@@ -465,9 +514,11 @@ def ensure_state():
     if "route_after" not in ss:
         ss.route_after = {"resp": None, "distance_m": None, "duration_s": None, "geometry": []}
     if "vrp" not in ss:
-        ss.vrp = {"create": None, "result": None, "order": None, "attempts": []}
+        ss.vrp = {"create": None, "result": None, "order": None, "job_id": None}
     if "last_json" not in ss:
         ss.last_json = {}
+    if "_optimized_stops" not in ss:
+        ss._optimized_stops = None
 
 def set_center(lat: float, lng: float, country: str | None = None):
     ss = st.session_state
@@ -508,14 +559,12 @@ def replace_stops(df_new: pd.DataFrame):
     st.session_state.stops_df = df_new.reset_index(drop=True)
 
 def clear_stops():
-    st.session_state.stops_df = pd.DataFrame(columns=["label", "address", "lat", "lng", "source"])
-    st.session_state.route_before = {"resp": None, "distance_m": None, "duration_s": None, "geometry": []}
-    st.session_state.route_after = {"resp": None, "distance_m": None, "duration_s": None, "geometry": []}
-    st.session_state.vrp = {"create": None, "result": None, "order": None, "attempts": []}
-    st.session_state.last_json = {}
-    st.session_state.mapsig["route_before"] += 1
-    st.session_state.mapsig["route_after"] += 1
-
+    ss = st.session_state
+    ss.stops_df = pd.DataFrame(columns=["label", "address", "lat", "lng", "source"])
+    ss.route_before = {"resp": None, "distance_m": None, "duration_s": None, "geometry": []}
+    ss.route_after = {"resp": None, "distance_m": None, "duration_s": None, "geometry": []}
+    ss.vrp = {"create": None, "result": None, "order": None, "job_id": None}
+    ss._optimized_stops = None
 
 # -----------------------------
 # API CALL BUILDERS
@@ -534,7 +583,6 @@ def build_global_route_params(ui: Dict[str, Any]) -> Dict[str, Any]:
     if avoid_list:
         p["avoid"] = ",".join(avoid_list)
 
-    # keep these as strings if supported; harmless if ignored
     if ui.get("traffic") is not None:
         p["traffic"] = "true" if ui["traffic"] else "false"
     if ui.get("alternatives") is not None:
@@ -565,19 +613,29 @@ def distance_matrix(origins: List[str], destinations: List[str], params_extra: D
     status, data = nb_get("/distancematrix/v2", params=params)
     return status, data
 
-def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any]) -> Tuple[int, Any]:
+def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any], custom_override: Optional[dict] = None) -> Tuple[int, Any]:
+    """
+    Directions endpoints are GET with params:
+      origin, destination, waypoints=... (pipe-separated)
+    """
     if len(order_latlng) < 2:
         return 0, {"error": "Need at least 2 points"}
+
     origin = order_latlng[0]
     dest = order_latlng[-1]
     waypoints = order_latlng[1:-1]
+
     params = dict(params_extra)
     params["origin"] = origin
     params["destination"] = dest
     if waypoints:
         params["waypoints"] = "|".join(waypoints)
 
-    # try common endpoints
+    # Allow custom override for directions params (merge)
+    if isinstance(custom_override, dict):
+        params.update(custom_override)
+
+    # try common endpoints in order
     status, data = nb_get("/directions/v2", params=params)
     if status == 404:
         status, data = nb_get("/navigation/v2", params=params)
@@ -585,87 +643,96 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any])
         status, data = nb_get("/directions", params=params)
     return status, data
 
-def vrp_build_payloads_v2(stops: pd.DataFrame, objective: str) -> List[Dict[str, Any]]:
+# -------- VRP v2 payload normalization (THIS is the big fix) --------
+def normalize_vrp_v2_body(body: Any) -> Tuple[Optional[dict], Optional[str]]:
     """
-    Different NB deployments have different schema expectations for locations.
-    We generate two payload variants and auto-try them:
-      A) locations: {"id":0, "location": ["lat,lng", ...]}   (locations.location exists)
-      B) locations: [{"id":i, "location":"lat,lng"}, ...]    (per-location object)
+    NextBillion Route Optimization v2 expects:
+      locations: [ "lat,lng", ... ]   (index-based)
+      jobs: [{id, location_index}, ...]
+      vehicles: [{id, start_index, end_index}, ...]
+      options: { objective: { travel_cost: "distance" | "duration" } }
+
+    This function:
+    - accepts correct dict
+    - fixes common wrong formats like:
+        {"locations":{"location":[...]} }
+        {"locations":{"id":0,"location":[...]} }
+        {"locations":[{"id":0,"location":"lat,lng"}, ...]}
+    and converts them into the correct list-of-strings shape.
     """
-    df = stops.reset_index(drop=True)
+    if not isinstance(body, dict):
+        return None, "VRP body must be a JSON object"
 
-    loc_list = [latlng_str(float(r["lat"]), float(r["lng"])) for _, r in df.iterrows()]
+    locs = body.get("locations")
 
-    # jobs reference location_index
+    # Case A: correct already: list[str]
+    if isinstance(locs, list) and all(isinstance(x, str) for x in locs):
+        return body, None
+
+    # Case B: locations is list[dict] with "location"
+    if isinstance(locs, list) and all(isinstance(x, dict) for x in locs):
+        loc_list = []
+        for x in locs:
+            loc = x.get("location")
+            if isinstance(loc, str):
+                loc_list.append(loc)
+        if loc_list:
+            body["locations"] = loc_list
+            return body, None
+
+    # Case C: locations is dict containing location list
+    if isinstance(locs, dict):
+        inner = locs.get("location") or locs.get("locations")
+        if isinstance(inner, list) and all(isinstance(x, str) for x in inner):
+            body["locations"] = inner
+            return body, None
+        # sometimes {"id":0,"location":[...]}
+        if isinstance(inner, list):
+            inner2 = [str(x) for x in inner if isinstance(x, (str, int, float))]
+            if inner2:
+                body["locations"] = inner2
+                return body, None
+
+    return None, "Could not normalize `locations`. Expected list of 'lat,lng' strings."
+
+def build_vrp_v2_body_from_stops(stops: pd.DataFrame, objective: str) -> dict:
+    loc_list = [latlng_str(float(r["lat"]), float(r["lng"])) for _, r in stops.reset_index(drop=True).iterrows()]
     jobs = [{"id": int(i), "location_index": int(i)} for i in range(len(loc_list))]
     vehicles = [{"id": "vehicle_1", "start_index": 0, "end_index": 0}]
-
-    options = {"objective": {"travel_cost": objective}}  # distance | duration
-
-    payload_a = {
-        "locations": {"id": 0, "location": loc_list},
+    body = {
+        "locations": loc_list,
         "jobs": jobs,
         "vehicles": vehicles,
-        "options": options,
+        "options": {"objective": {"travel_cost": objective}},
     }
+    return body
 
-    payload_b = {
-        "locations": [{"id": int(i), "location": loc_list[i]} for i in range(len(loc_list))],
-        "jobs": jobs,
-        "vehicles": vehicles,
-        "options": options,
-    }
-
-    return [payload_a, payload_b]
-
-def vrp_create_v2(stops: pd.DataFrame, objective: str, custom_override_json: str = "") -> Tuple[int, Any]:
-    """
-    POST /optimization/v2 with auto schema retry.
-    If user provides custom JSON override, we try that first (after parsing),
-    then try our generated payload variants.
-    """
+def vrp_create_v2(stops: pd.DataFrame, objective: str, custom_override: Optional[Any] = None) -> Tuple[int, Any, Optional[dict]]:
     if len(stops) < 2:
-        return 0, {"error": "Need at least 2 stops"}
+        return 0, {"error": "Need at least 2 stops"}, None
 
-    attempts: List[Dict[str, Any]] = []
+    body = build_vrp_v2_body_from_stops(stops, objective=objective)
+
+    # Apply override if provided (must be dict)
+    if isinstance(custom_override, dict) and custom_override:
+        # If user provides full body, use it; else shallow merge
+        # Heuristic: if override has 'locations' or 'jobs' or 'vehicles', treat as full override
+        if any(k in custom_override for k in ["locations", "jobs", "vehicles", "options"]):
+            body = custom_override
+        else:
+            body.update(custom_override)
+
+    fixed, err = normalize_vrp_v2_body(body)
+    if err:
+        return 0, {"error": err, "candidate_body": body}, None
+
     params = {"key": NB_API_KEY}
+    status, data = nb_post("/optimization/v2", params=params, body=fixed)
 
-    # 1) custom override (optional)
-    if custom_override_json.strip():
-        try:
-            custom_body = json.loads(custom_override_json)
-            attempts.append({"label": "custom_override", "body": custom_body})
-        except Exception as e:
-            st.warning(f"Custom VRP JSON could not be parsed. Ignoring override. Error: {e}")
+    st.session_state.last_json["vrp_create_payload"] = fixed
+    st.session_state.last_json["vrp_create_response"] = data
 
-    # 2) generated variants
-    for i, b in enumerate(vrp_build_payloads_v2(stops, objective), start=1):
-        attempts.append({"label": f"generated_variant_{i}", "body": b})
-
-    # try attempts in order until success
-    ss = st.session_state
-    ss.vrp["attempts"] = []
-    last_status, last_data = 0, None
-
-    for att in attempts:
-        body = att["body"]
-        status, data = nb_post("/optimization/v2", params=params, body=body)
-
-        ss.vrp["attempts"].append({"label": att["label"], "payload": body, "status": status, "response": data})
-        last_status, last_data = status, data
-
-        # success in many deployments is 200; some may return 202
-        if status in (200, 202):
-            ss.last_json["vrp_create_payload"] = body
-            ss.last_json["vrp_create_response"] = data
-            return status, data
-
-        # if schema error, continue trying next variant
-        # (we don't hard-match message here because responses vary)
-
-    ss.last_json["vrp_create_payload"] = attempts[-1]["body"] if attempts else {}
-    ss.last_json["vrp_create_response"] = last_data
-    return last_status, last_data
+    return status, data, fixed
 
 def vrp_result_v2(job_id: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY, "id": job_id}
@@ -676,119 +743,90 @@ def vrp_result_v2(job_id: str) -> Tuple[int, Any]:
 def parse_vrp_order(resp: Any) -> Optional[List[int]]:
     """
     Extract visit order as location indices.
-    Handles common shapes:
-      - routes[0].steps[*].location_index
-      - routes[0].activities[*].location_index
+    Supports:
+      - resp.result.routes[0].steps[*].location_index
+      - resp.routes[0].steps[*].location_index
     """
     if not isinstance(resp, dict):
         return None
 
-    routes = resp.get("routes") or safe_get(resp, ["result", "routes"]) or safe_get(resp, ["solution", "routes"])
+    routes = resp.get("routes") or deep_get(resp, ["result", "routes"]) or deep_get(resp, ["solution", "routes"])
     if isinstance(routes, dict):
         routes = [routes]
     if not routes or not isinstance(routes, list):
         return None
 
     r0 = routes[0] if isinstance(routes[0], dict) else {}
-    steps = r0.get("steps") or r0.get("activities") or []
-
+    steps = r0.get("steps") or r0.get("activities") or r0.get("stops") or []
     order: List[int] = []
     for s in steps:
         if not isinstance(s, dict):
             continue
-        li = s.get("location_index", s.get("locationIndex"))
+        li = s.get("location_index")
+        if li is None:
+            li = s.get("locationIndex")
         if li is not None:
             try:
                 order.append(int(li))
             except Exception:
                 pass
 
-    if not order:
-        return None
-
-    # unique-preserving
-    seen = set()
-    out = []
-    for x in order:
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-def snap_to_roads(path_points: List[Tuple[float, float]], mode: str, geometry: str = "geojson") -> Tuple[int, Any, Dict[str, Any]]:
-    """
-    Snap To Roads API per docs:
-      GET/POST https://api.nextbillion.io/snapToRoads/json?key=...
-      Required: path (lat,lng|lat,lng|...)
-      Optional: mode, geometry=geojson
-    We'll use POST to avoid URL length issues for larger paths.
-    """
-    if not path_points:
-        return 0, {"error": "No points to snap"}, {}
-
-    path_str = "|".join([latlng_str(p[0], p[1]) for p in path_points])
-
-    params = {"key": NB_API_KEY}
-    body = {
-        "path": path_str,
-        "mode": mode,
-        "geometry": geometry,  # "geojson" for drawable geometry
-    }
-
-    status, data = nb_post("/snapToRoads/json", params=params, body=body)
-    meta = {"payload": body, "endpoint": "/snapToRoads/json", "method": "POST"}
-    return status, data, meta
-
-def isochrone_get(center: Tuple[float, float], mode: str, iso_type: str, value: int) -> Tuple[int, Any, Dict[str, Any]]:
-    """
-    Isochrone API is GET style in NB docs.
-    Common params:
-      key, mode, origins=lat,lng, contours_minutes or contours_meters, polygons=true
-    We'll support time (minutes) and distance (meters).
-    """
-    lat, lng = center
-    params = {
-        "key": NB_API_KEY,
-        "mode": mode,
-        "origins": latlng_str(lat, lng),
-        "polygons": "true",
-    }
-    if iso_type == "time":
-        # value is seconds in UI -> convert to minutes (ceil)
-        minutes = max(1, int(math.ceil(value / 60.0)))
-        params["contours_minutes"] = str(minutes)
-    else:
-        # value is meters in UI
-        meters = max(1, int(value))
-        params["contours_meters"] = str(meters)
-
-    status, data = nb_get("/isochrone/json", params=params)
-    meta = {"params": params, "endpoint": "/isochrone/json", "method": "GET"}
-    return status, data, meta
-
-def extract_isochrone_geojson(resp: Any) -> Optional[Dict[str, Any]]:
-    """
-    Try to extract drawable GeoJSON from isochrone response.
-    NB commonly returns FeatureCollection.
-    """
-    if not isinstance(resp, dict):
-        return None
-
-    if resp.get("type") == "FeatureCollection" and isinstance(resp.get("features"), list):
-        return resp
-
-    # sometimes nested
-    fc = resp.get("geojson") or resp.get("data") or resp.get("result")
-    if isinstance(fc, dict) and fc.get("type") == "FeatureCollection":
-        return fc
-
-    # sometimes "features" directly
-    if isinstance(resp.get("features"), list):
-        return {"type": "FeatureCollection", "features": resp["features"]}
-
+    if order:
+        seen = set()
+        out = []
+        for x in order:
+            if x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+        return out
     return None
 
+# -----------------------------
+# ISOCHRONE (correct API)
+# -----------------------------
+def isochrone_get(center_lat: float, center_lng: float, mode: str, kind: str, value: int, extra_params: Optional[dict] = None) -> Tuple[int, Any]:
+    """
+    Isochrone API is GET:
+      /isochrone/json?key=...&coordinates=lat,lng&mode=car&contours_minutes=5
+    Only one of contours_minutes or contours_meters. 422 may occur due to underlying map issues. (NB docs)
+    """
+    params = {"key": NB_API_KEY, "coordinates": latlng_str(center_lat, center_lng), "mode": mode}
+
+    if kind == "time":
+        # value expected in minutes by API examples; accept seconds too (we convert if big)
+        minutes = int(value)
+        if minutes > 240:  # if user accidentally entered seconds
+            minutes = max(1, int(round(minutes / 60.0)))
+        params["contours_minutes"] = minutes
+    else:
+        meters = int(value)
+        params["contours_meters"] = meters
+
+    if isinstance(extra_params, dict):
+        params.update(extra_params)
+
+    return nb_get("/isochrone/json", params=params)
+
+# -----------------------------
+# SNAP TO ROADS (correct API)
+# -----------------------------
+def snap_to_roads(points: List[Tuple[float, float]], extra_params: Optional[dict] = None) -> Tuple[int, Any, dict]:
+    """
+    Snap To Roads API:
+      POST https://api.nextbillion.io/snapToRoads/json?key=...
+      Body example uses 'path' polyline-ish string or coordinates list depending on docs.
+    We'll send `path` as "lat,lng|lat,lng|..."
+    """
+    params = {"key": NB_API_KEY}
+    if isinstance(extra_params, dict):
+        params.update(extra_params)
+
+    path = "|".join([latlng_str(p[0], p[1]) for p in points])
+    body = {"path": path, "interpolate": True}  # interpolate common option; safe if ignored
+
+    status, data = nb_post("/snapToRoads/json", params=params, body=body)
+    return status, data, body
 
 # -----------------------------
 # UI
@@ -799,7 +837,7 @@ ss = st.session_state
 st.title("NextBillion.ai — Visual API Tester")
 st.caption(f"Stops loaded: {len(ss.stops_df)}")
 
-# Sidebar: global route options
+# Sidebar: global route options (only applied when you click buttons)
 with st.expander("Global route options (Directions / Matrix / Optimize)", expanded=False):
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
 
@@ -812,21 +850,12 @@ with st.expander("Global route options (Directions / Matrix / Optimize)", expand
     with c4:
         alternatives = st.selectbox("Alternatives", YESNO, index=0, key="g_alts")
 
-    avoid_options = [
-        "toll", "highway", "ferry", "indoor", "unpaved", "tunnel",
-        "sharp_turn", "u_turn", "service_road"
-    ]
+    avoid_options = ["toll", "highway", "ferry", "indoor", "unpaved", "tunnel", "sharp_turn", "u_turn", "service_road"]
     avoid = st.multiselect("Avoid", avoid_options, default=[], key="g_avoid")
 
     dep_col1, dep_col2 = st.columns([1, 1])
     with dep_col1:
-        dep_unix = st.number_input(
-            "Departure time (unix seconds)",
-            min_value=0,
-            value=_now_unix(),
-            step=60,
-            key="g_dep_unix",
-        )
+        dep_unix = st.number_input("Departure time (unix seconds)", min_value=0, value=_now_unix(), step=60, key="g_dep_unix")
     with dep_col2:
         st.write("Human readable")
         st.code(unix_to_human(int(dep_unix)))
@@ -891,6 +920,7 @@ with st.sidebar:
 
     st.caption("Tip: Geocode once → reuse across all tabs (saves API calls).")
 
+# Tabs
 tabs = st.tabs([
     "Geocode & Map",
     "Places (Search + Generate Stops)",
@@ -898,7 +928,6 @@ tabs = st.tabs([
     "Distance Matrix (NxN)",
     "Snap-to-Road + Isochrone",
 ])
-
 
 # -----------------------------
 # TAB 1: GEOCODE & MAP
@@ -917,13 +946,13 @@ with tabs[0]:
 
     if st.button("🧭 Geocode all missing coordinates (cached)", key="geo_geocode_btn", use_container_width=True):
         missing = df[df["lat"].isna() | df["lng"].isna()].copy()
-        last_resp = None
+        resp_sample = None
         for idx, row in missing.iterrows():
             addr = str(row.get("address") or "").strip()
             if not addr:
                 continue
             status, resp = geocode_forward(addr, country=ss.center["country"], language=language)
-            last_resp = resp
+            resp_sample = resp
             candidates = extract_geocode_candidates(resp)
             if candidates:
                 top = candidates[0]
@@ -934,7 +963,7 @@ with tabs[0]:
                 df.loc[idx, "source"] = f"Geocode failed ({status})"
 
         replace_stops(df)
-        ss.last_json["geocode_response_sample"] = last_resp
+        ss.last_json["geocode_response_sample"] = resp_sample
         ss.mapsig["geocode"] += 1
 
     st.dataframe(ss.stops_df, use_container_width=True, height=220)
@@ -960,7 +989,6 @@ with tabs[0]:
             mime="application/json",
             key="dl_stops_json",
         )
-
 
 # -----------------------------
 # TAB 2: PLACES + GENERATE STOPS
@@ -1002,9 +1030,10 @@ with tabs[1]:
             ss.mapsig["places"] += 1
 
     st.markdown("### Generate random stops (no keyword needed)")
+
     g1, g2, g3, g4 = st.columns([1, 1, 1, 1])
     with g1:
-        n_rand = st.number_input("How many stops?", min_value=2, max_value=60, value=20, step=1, key="pl_n_rand")
+        n_rand = st.number_input("How many stops?", min_value=2, max_value=200, value=20, step=1, key="pl_n_rand")
     with g2:
         radius_m = st.number_input("Radius (m)", min_value=200, max_value=200000, value=5000, step=100, key="pl_radius")
     with g3:
@@ -1030,23 +1059,21 @@ with tabs[1]:
 
         if resolve_addr == "Yes":
             df = ss.stops_df.copy()
-            last_rev = None
             for idx, row in df[df["source"].str.contains("Random", na=False)].iterrows():
                 if str(row.get("address") or "").strip():
                     continue
                 status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
-                last_rev = rresp
                 cand = extract_geocode_candidates(rresp)
                 if cand:
                     df.loc[idx, "address"] = cand[0]["name"]
                     df.loc[idx, "source"] = f"Reverse-geocode ({status})"
             replace_stops(df)
-            ss.last_json["reverse_geocode_sample"] = last_rev
 
         ss.mapsig["places"] += 1
 
     st.divider()
     st.markdown("### Optional: POI keyword search (best-effort) and add results as stops")
+
     kw = st.text_input("POI keyword (e.g., petrol, hospital, warehouse)", value="", key="pl_kw")
     kw_radius = st.slider("Search radius (m)", min_value=500, max_value=200000, value=5000, step=500, key="pl_kw_radius")
     kw_max = st.slider("Max results", min_value=1, max_value=50, value=10, step=1, key="pl_kw_max")
@@ -1063,7 +1090,7 @@ with tabs[1]:
                 "language": language,
                 "at": latlng_str(float(ss.center["lat"]), float(ss.center["lng"])),
                 "radius": int(kw_radius),
-                "limit": int(kw_max)
+                "limit": int(kw_max),
             }
             status, resp = nb_get("/geocode", params=params)
             if status == 404:
@@ -1091,7 +1118,6 @@ with tabs[1]:
             key="dl_places_json",
         )
 
-
 # -----------------------------
 # TAB 3: ROUTE + OPTIMIZE
 # -----------------------------
@@ -1105,19 +1131,42 @@ with tabs[2]:
 
         left, right = st.columns([1.15, 1.0])
 
+        # Custom override boxes
+        with st.expander("Advanced: Custom request overrides (JSON) — optional", expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                directions_override_txt = st.text_area("Directions override (query params JSON)", value="{}", height=120, key="adv_dir_override")
+            with c2:
+                vrp_override_txt = st.text_area("VRP override (full body JSON)", value="{}", height=120, key="adv_vrp_override")
+
+        dir_override = safe_json_loads(directions_override_txt) or {}
+        vrp_override = safe_json_loads(vrp_override_txt) or {}
+
         with left:
             st.markdown("### Step 1 — Directions (Before)")
 
             if st.button("🧭 Compute route (Before)", key="rt_before_btn", use_container_width=True):
-                status_d, resp_d = directions_multi_stop(stops_ll, params_extra=GLOBAL_PARAMS)
+                # Directions
+                status_d, resp_d = directions_multi_stop(stops_ll, params_extra=GLOBAL_PARAMS, custom_override=dir_override)
                 ss.route_before["resp"] = resp_d
                 ss.last_json["directions_before"] = resp_d
 
-                ss.route_before["geometry"] = extract_route_geometry(resp_d)
-                dist_m, dur_s = extract_directions_totals(resp_d)
-                ss.route_before["distance_m"] = dist_m
-                ss.route_before["duration_s"] = dur_s
+                geom = extract_route_geometry(resp_d)
+                ss.route_before["geometry"] = geom
 
+                # Totals: prefer directions totals
+                dist_m, dur_s = extract_route_totals(resp_d)
+
+                # fallback to matrix pairs
+                if dist_m is None or dur_s is None:
+                    status_m, data_m = distance_matrix(stops_ll[:-1], stops_ll[1:], params_extra=GLOBAL_PARAMS)
+                    ss.last_json["matrix_pairs_before"] = data_m
+                    d2, t2 = extract_matrix_pairs_totals(data_m)
+                    dist_m = dist_m if dist_m is not None else d2
+                    dur_s = dur_s if dur_s is not None else t2
+
+                ss.route_before["distance_m"] = float(dist_m or 0.0)
+                ss.route_before["duration_s"] = float(dur_s or 0.0)
                 ss.mapsig["route_before"] += 1
 
             before_geom = ss.route_before.get("geometry") or []
@@ -1142,115 +1191,84 @@ with tabs[2]:
 
             objective = st.selectbox("Optimization objective", ["distance", "duration"], index=0, key="vrp_obj")
 
-            st.caption("Optional: Custom VRP request body override (JSON). Leave {} to use generated payload + auto-retry.")
-            custom_vrp = st.text_area("VRP body override", value="{}", height=120, key="vrp_custom")
+            if st.button("⚙️ Run optimization (VRP v2)", key="vrp_run_btn", use_container_width=True):
+                status_c, data_c, fixed_body = vrp_create_v2(ss.stops_df, objective=objective, custom_override=vrp_override)
 
-            run_col1, run_col2 = st.columns([1, 1])
-            with run_col1:
-                if st.button("⚙️ Run optimization (VRP v2)", key="vrp_run_btn", use_container_width=True):
-                    # treat "{}" as empty override
-                    override_str = "" if custom_vrp.strip() in ("", "{}", "null") else custom_vrp
+                ss.last_json["vrp_create_payload"] = fixed_body
+                ss.last_json["vrp_create_response"] = data_c
 
-                    status_c, data_c = vrp_create_v2(ss.stops_df, objective=objective, custom_override_json=override_str)
+                if status_c != 200:
+                    st.error(f"VRP create failed: HTTP {status_c}")
+                    st.json(data_c)
+                else:
                     ss.vrp["create"] = data_c
+                    job_id = data_c.get("id") or data_c.get("job_id") or data_c.get("jobId")
+                    ss.vrp["job_id"] = job_id
+                    st.success(f"Optimization job created. Job id: {job_id}")
 
-                    if status_c not in (200, 202):
-                        st.error(f"VRP create failed: HTTP {status_c}")
-                        st.json(data_c)
-
-                        with st.expander("VRP attempts (debug)", expanded=True):
-                            st.json(ss.vrp.get("attempts", []))
-                    else:
-                        # job id can be in different fields
-                        job_id = None
-                        if isinstance(data_c, dict):
-                            job_id = data_c.get("id") or data_c.get("job_id") or data_c.get("jobId")
-                        if not job_id:
-                            st.warning("VRP create succeeded, but no job id found in response.")
-                        else:
-                            # poll result
-                            result = None
-                            last_rr = None
-                            for _ in range(12):
-                                stt, rr = vrp_result_v2(str(job_id))
-                                last_rr = rr
-                                if stt == 200 and isinstance(rr, dict):
-                                    # some deployments return status/solution readiness inside
-                                    result = rr
-                                    break
-                                time.sleep(1.0)
-
-                            ss.vrp["result"] = result or last_rr
-                            if result is None:
-                                st.warning("VRP result not ready yet. Try 'Fetch VRP result again'.")
-                            else:
-                                order = parse_vrp_order(result)
-                                ss.vrp["order"] = order
-
-                                if order:
-                                    df2 = ss.stops_df.copy().reset_index(drop=True)
-                                    valid = [i for i in order if 0 <= i < len(df2)]
-                                    missing = [i for i in range(len(df2)) if i not in valid]
-                                    final_order = valid + missing
-                                    df_after = df2.iloc[final_order].reset_index(drop=True)
-
-                                    ss._optimized_stops = df_after
-                                    ss.mapsig["route_after"] += 1
-
-                                    if valid == list(range(len(df2))):
-                                        st.warning("VRP returned the same order as input (no visible change). Check VRP constraints/objective or result schema.")
-                                    else:
-                                        st.success("Optimization order computed.")
-                                else:
-                                    st.warning("Optimization result did not include an order we could parse. Check VRP result JSON.")
-
-            with run_col2:
-                if st.button("🔁 Fetch VRP result again", key="vrp_fetch_again", use_container_width=True):
-                    create = ss.vrp.get("create")
-                    job_id = None
-                    if isinstance(create, dict):
-                        job_id = create.get("id") or create.get("job_id") or create.get("jobId")
-                    if not job_id:
-                        st.warning("No job id found. Run VRP create first.")
-                    else:
+            if st.button("🔄 Fetch VRP result again", key="vrp_fetch_btn", use_container_width=True):
+                job_id = ss.vrp.get("job_id")
+                if not job_id:
+                    st.warning("No job id yet. Run optimization first.")
+                else:
+                    # Poll with a few attempts (VRP can be async)
+                    result = None
+                    last = None
+                    for _ in range(12):
                         stt, rr = vrp_result_v2(str(job_id))
-                        ss.vrp["result"] = rr
-                        st.info(f"Fetch result: HTTP {stt}")
-                        order = parse_vrp_order(rr)
+                        last = rr
+                        if stt == 200:
+                            result = rr
+                            break
+                        time.sleep(1.0)
+
+                    ss.vrp["result"] = result or last
+                    if result is None:
+                        st.error("Could not fetch VRP result (yet). Try again.")
+                        st.json(last)
+                    else:
+                        order = parse_vrp_order(result)
                         ss.vrp["order"] = order
+
                         if order:
                             df2 = ss.stops_df.copy().reset_index(drop=True)
                             valid = [i for i in order if 0 <= i < len(df2)]
                             missing = [i for i in range(len(df2)) if i not in valid]
                             final_order = valid + missing
                             ss._optimized_stops = df2.iloc[final_order].reset_index(drop=True)
+                            st.success("Optimization order parsed and applied.")
                             ss.mapsig["route_after"] += 1
-                            st.success("Optimized order updated from latest result.")
                         else:
-                            st.warning("Still could not parse an order from the VRP result.")
-
-            with st.expander("VRP attempts + payloads (debug)", expanded=False):
-                st.json(ss.vrp.get("attempts", []))
-                st.json(ss.vrp.get("result"))
+                            st.warning("VRP result fetched, but order could not be parsed from result schema.")
+                            st.json(result)
 
             st.markdown("### Step 3 — Recompute Directions (After)")
 
-            df_after = ss.get("_optimized_stops", None)
-            if df_after is None:
-                st.info("Run optimization to generate an optimized order.")
-                df_after = ss.stops_df.copy()
+            df_after = ss._optimized_stops if ss._optimized_stops is not None else ss.stops_df.copy()
+            if ss._optimized_stops is None:
+                st.info("Run optimization + fetch result to apply an optimized order (otherwise After uses current order).")
 
             if st.button("🧭 Compute route (After)", key="rt_after_btn", use_container_width=True):
                 ll_after = [latlng_str(float(r.lat), float(r.lng)) for r in df_after.itertuples()]
 
-                status_d2, resp_d2 = directions_multi_stop(ll_after, params_extra=GLOBAL_PARAMS)
+                status_d2, resp_d2 = directions_multi_stop(ll_after, params_extra=GLOBAL_PARAMS, custom_override=dir_override)
                 ss.route_after["resp"] = resp_d2
                 ss.last_json["directions_after"] = resp_d2
 
-                ss.route_after["geometry"] = extract_route_geometry(resp_d2)
-                dist_m2, dur_s2 = extract_directions_totals(resp_d2)
-                ss.route_after["distance_m"] = dist_m2
-                ss.route_after["duration_s"] = dur_s2
+                geom2 = extract_route_geometry(resp_d2)
+                ss.route_after["geometry"] = geom2
+
+                dist_m2, dur_s2 = extract_route_totals(resp_d2)
+
+                if dist_m2 is None or dur_s2 is None:
+                    status_m2, data_m2 = distance_matrix(ll_after[:-1], ll_after[1:], params_extra=GLOBAL_PARAMS)
+                    ss.last_json["matrix_pairs_after"] = data_m2
+                    d2, t2 = extract_matrix_pairs_totals(data_m2)
+                    dist_m2 = dist_m2 if dist_m2 is not None else d2
+                    dur_s2 = dur_s2 if dur_s2 is not None else t2
+
+                ss.route_after["distance_m"] = float(dist_m2 or 0.0)
+                ss.route_after["duration_s"] = float(dur_s2 or 0.0)
 
                 ss.mapsig["route_after"] += 1
 
@@ -1271,27 +1289,33 @@ with tabs[2]:
             if adur is not None:
                 st.metric("After duration (min)", f"{adur/60:.1f}")
 
-            if ss.route_before.get("distance_m") and ss.route_after.get("distance_m"):
-                b = float(ss.route_before["distance_m"])
-                a = float(ss.route_after["distance_m"])
-                saved = b - a
-                pct = (saved / b * 100.0) if b > 0 else 0.0
-                st.success(f"Distance saved: {saved/1000:.2f} km ({pct:.1f}%)")
-            if ss.route_before.get("duration_s") and ss.route_after.get("duration_s"):
-                b = float(ss.route_before["duration_s"])
-                a = float(ss.route_after["duration_s"])
-                saved = b - a
-                pct = (saved / b * 100.0) if b > 0 else 0.0
-                st.success(f"Time saved: {saved/60:.1f} min ({pct:.1f}%)")
+            # Comparison
+            if ss.route_before.get("distance_m") is not None and ss.route_after.get("distance_m") is not None:
+                b = float(ss.route_before["distance_m"] or 0)
+                a = float(ss.route_after["distance_m"] or 0)
+                if b > 0 and a > 0:
+                    saved = b - a
+                    pct = (saved / b * 100.0) if b > 0 else 0.0
+                    st.success(f"Distance saved: {saved/1000:.2f} km ({pct:.1f}%)")
+
+            if ss.route_before.get("duration_s") is not None and ss.route_after.get("duration_s") is not None:
+                b = float(ss.route_before["duration_s"] or 0)
+                a = float(ss.route_after["duration_s"] or 0)
+                if b > 0 and a > 0:
+                    saved = b - a
+                    pct = (saved / b * 100.0) if b > 0 else 0.0
+                    st.success(f"Time saved: {saved/60:.1f} min ({pct:.1f}%)")
 
         with st.expander("Download JSON (debug)", expanded=False):
             bundle = {
                 "directions_before": ss.last_json.get("directions_before"),
                 "directions_after": ss.last_json.get("directions_after"),
+                "matrix_pairs_before": ss.last_json.get("matrix_pairs_before"),
+                "matrix_pairs_after": ss.last_json.get("matrix_pairs_after"),
                 "vrp_create_payload": ss.last_json.get("vrp_create_payload"),
                 "vrp_create_response": ss.last_json.get("vrp_create_response"),
                 "vrp_result_response": ss.last_json.get("vrp_result_response"),
-                "vrp_attempts": ss.vrp.get("attempts", []),
+                "parsed_vrp_order": ss.vrp.get("order"),
             }
             st.download_button(
                 "Download Route+Optimize JSON bundle",
@@ -1300,7 +1324,6 @@ with tabs[2]:
                 mime="application/json",
                 key="dl_bundle",
             )
-
 
 # -----------------------------
 # TAB 4: DISTANCE MATRIX (NxN)
@@ -1316,7 +1339,7 @@ with tabs[3]:
             n = 2
             st.caption("Only 2 stops available.")
         else:
-            n = st.slider("How many stops to include in NxN?", min_value=2, max_value=max_n, value=min(20, max_n), step=1, key="mx_n")
+            n = st.slider("How many stops to include in NxN?", min_value=2, max_value=max_n, value=min(25, max_n), step=1, key="mx_n")
 
         use_first_n = st.selectbox("Use", ["First N stops", "All stops"], index=0, key="mx_use")
         df_use = ss.stops_df.copy()
@@ -1344,8 +1367,8 @@ with tabs[3]:
             dur_min = []
             for r in rows:
                 elems = r.get("elements") or []
-                dist_km.append([((e.get("distance") or {}).get("value") or 0) / 1000 for e in elems])
-                dur_min.append([((e.get("duration") or {}).get("value") or 0) / 60 for e in elems])
+                dist_km.append([((e.get("distance") or {}).get("value") or e.get("distance") or 0) / 1000 for e in elems])
+                dur_min.append([((e.get("duration") or {}).get("value") or e.get("duration") or 0) / 60 for e in elems])
 
             st.markdown("### Distance (km)")
             st.dataframe(pd.DataFrame(dist_km).round(2), use_container_width=True, height=240)
@@ -1361,101 +1384,95 @@ with tabs[3]:
                 key="dl_matrix_json",
             )
 
-
 # -----------------------------
 # TAB 5: SNAP-TO-ROAD + ISOCHRONE
 # -----------------------------
 with tabs[4]:
-    st.subheader("Snap-to-Road + Isochrone (stable UI; runs only on button click)")
+    st.subheader("Snap-to-Road + Isochrone (correct endpoints; stable UI; runs only on button click)")
+
+    with st.expander("Advanced: Custom request overrides (JSON) — optional", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            snap_override_txt = st.text_area("Snap-to-roads override (query/body merge JSON)", value="{}", height=110, key="adv_snap_override")
+        with c2:
+            iso_override_txt = st.text_area("Isochrone override (query params JSON)", value="{}", height=110, key="adv_iso_override")
+
+    snap_override = safe_json_loads(snap_override_txt) or {}
+    iso_override = safe_json_loads(iso_override_txt) or {}
 
     s1, s2 = st.columns([1, 1])
 
     with s1:
-        st.markdown("### Snap-to-Road (uses Snap To Roads API)")
+        st.markdown("### Snap-to-Roads")
+
         src = st.selectbox("Path source", ["Use Directions (Before) geometry", "Use Directions (After) geometry"], index=0, key="snap_src")
         geom = ss.route_before.get("geometry") if src.startswith("Use Directions (Before)") else ss.route_after.get("geometry")
         coords = geom or []
 
-        # custom max for snapping
-        max_pts = max(2, len(coords)) if coords else 2
-        if max_pts <= 2:
-            n_path = 2
+        max_pts = len(coords) if coords else 0
+        if max_pts < 2:
             st.caption("Not enough geometry points yet. Compute a route first.")
+            n_path = 0
         else:
-            n_path = st.number_input(
-                "N geometry points to send (first N) (max 200 recommended for POST)",
+            n_path = st.slider(
+                "N geometry points to send (first N)",
                 min_value=2,
                 max_value=max_pts,
-                value=min(200, max_pts),
+                value=min(500, max_pts),
                 step=1,
                 key="snap_n",
             )
 
-        snap_geometry = st.selectbox("Return geometry", ["geojson", "polyline"], index=0, key="snap_geom")
-        if st.button("🧷 Snap to Road", key="snap_btn", use_container_width=True):
-            pts = coords[: int(n_path)] if coords else []
-            status, data, meta = snap_to_roads(pts, mode=GLOBAL_PARAMS.get("mode", "car"), geometry=snap_geometry)
-            ss.last_json["snap"] = {"status": status, "response": data, "meta": meta}
+        snapped_pts: List[Tuple[float, float]] = []
+        if st.button("🧷 Snap to Roads", key="snap_btn", use_container_width=True):
+            pts = coords[: int(n_path)]
+            status, data, payload = snap_to_roads(pts, extra_params=snap_override if isinstance(snap_override, dict) else None)
+            ss.last_json["snap"] = {"status": status, "response": data, "payload": payload}
             ss.mapsig["snap"] += 1
 
             if status != 200:
-                st.error(f"Snap-to-road failed: HTTP {status}")
+                st.error(f"Snap-to-roads failed: HTTP {status}")
                 st.json(data)
             else:
-                st.success("Snap-to-road computed (cached).")
+                st.success("Snap-to-roads computed (cached).")
 
-        # Try to draw snapped route if geojson returned
-        snap_geo = None
-        snap_resp = ss.last_json.get("snap", {}).get("response")
+        snap_resp = deep_get(ss.last_json, ["snap", "response"])
         if isinstance(snap_resp, dict):
-            # docs mention geometry can be "..." or geojson depending on geometry param
-            g = snap_resp.get("geometry")
-            if isinstance(g, dict) and g.get("type") in ("FeatureCollection", "Feature"):
-                snap_geo = g
-            elif isinstance(g, str) and snap_geometry == "polyline":
-                pts5 = decode_polyline(g, precision=5)
-                pts6 = decode_polyline(g, precision=6)
-                snap_line = pts6 if (pts6 and len(pts6) >= len(pts5)) else pts5
-            else:
-                snap_line = None
-        else:
-            snap_line = None
+            snapped_pts = extract_snap_geometry(snap_resp)
 
         m5 = make_map(
             center=(float(ss.center["lat"]), float(ss.center["lng"])),
             stops=ss.stops_df,
-            route_pts=(snap_line if snap_line else (coords[: int(n_path)] if coords else None)),
+            route_pts=snapped_pts if snapped_pts else (coords[: int(n_path)] if coords and n_path else None),
             clicked=ss.clicked_pin,
             zoom=12,
         )
-        if snap_geo:
-            try:
-                folium.GeoJson(snap_geo).add_to(m5)
-            except Exception:
-                pass
         render_map(m5, key=f"map_snap_{ss.mapsig['snap']}")
 
     with s2:
-        st.markdown("### Isochrone (draws outline)")
-        iso_type = st.selectbox("Type", ["time", "distance"], index=0, key="iso_type")
+        st.markdown("### Isochrone (GET /isochrone/json)")
+
+        iso_kind = st.selectbox("Type", ["time", "distance"], index=0, key="iso_kind")
         iso_mode = st.selectbox("Mode", ["car", "truck", "bike", "walk"], index=0, key="iso_mode")
 
-        # Custom input box (lets you exceed slider limits if you want)
-        if iso_type == "time":
-            st.caption("Time value is in **seconds** (API uses minutes internally).")
-            iso_val = st.number_input("Value (seconds)", min_value=60, max_value=1_000_000, value=1800, step=60, key="iso_val_time")
+        # Increase limits (you asked)
+        if iso_kind == "time":
+            iso_val = st.number_input("Value (minutes; if you paste seconds we auto-convert)", min_value=1, max_value=240, value=10, step=1, key="iso_val_min")
         else:
-            st.caption("Distance value is in **meters**.")
-            iso_val = st.number_input("Value (meters)", min_value=100, max_value=5_000_000, value=5000, step=100, key="iso_val_dist")
+            iso_val = st.number_input("Value (meters)", min_value=100, max_value=200000, value=5000, step=100, key="iso_val_m")
 
+        poly_rings: List[List[Tuple[float, float]]] = []
         if st.button("🟦 Compute Isochrone", key="iso_btn", use_container_width=True):
-            status, data, meta = isochrone_get(
-                center=(float(ss.center["lat"]), float(ss.center["lng"])),
+            status, data = isochrone_get(
+                center_lat=float(ss.center["lat"]),
+                center_lng=float(ss.center["lng"]),
                 mode=iso_mode,
-                iso_type=iso_type,
+                kind=iso_kind,
                 value=int(iso_val),
+                extra_params=iso_override if isinstance(iso_override, dict) else None,
             )
-            ss.last_json["iso"] = {"status": status, "response": data, "meta": meta}
+
+            ss.last_json["iso"] = {"status": status, "response": data, "params": {"kind": iso_kind, "mode": iso_mode, "value": int(iso_val)}}
             ss.mapsig["iso"] += 1
 
             if status != 200:
@@ -1464,13 +1481,16 @@ with tabs[4]:
             else:
                 st.success("Isochrone computed (cached).")
 
-        iso_geo = extract_isochrone_geojson(ss.last_json.get("iso", {}).get("response"))
+        iso_resp = deep_get(ss.last_json, ["iso", "response"])
+        if isinstance(iso_resp, dict):
+            poly_rings = extract_geojson_polygons(iso_resp)
+
         m6 = make_map(
             center=(float(ss.center["lat"]), float(ss.center["lng"])),
             stops=ss.stops_df,
             clicked=ss.clicked_pin,
-            isochrone_geojson=iso_geo,
-            zoom=12
+            polygons=poly_rings if poly_rings else None,
+            zoom=12,
         )
         render_map(m6, key=f"map_iso_{ss.mapsig['iso']}")
 
