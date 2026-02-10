@@ -1200,3 +1200,325 @@ with tabs[5]:
 
     st.markdown("### Saved JSON bundles")
     st.json(ss.last_json)
+
+import json
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+import streamlit as st
+import polyline  # pip install polyline
+
+
+NB_BASE = "https://api.nextbillion.io"
+
+
+# -----------------------------
+# Session State Helpers
+# -----------------------------
+def init_state():
+    st.session_state.setdefault("run_logs", [])
+    st.session_state.setdefault("last_vrp_job_id", None)
+    st.session_state.setdefault("last_vrp_result", None)
+    st.session_state.setdefault("last_route_latlng", None)  # list[(lat,lng)]
+    st.session_state.setdefault("api_key", "")
+
+
+def add_log(entry: Dict[str, Any]) -> None:
+    st.session_state.run_logs.append(entry)
+
+
+def download_logs_button():
+    payload = {
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "logs": st.session_state.run_logs,
+    }
+    st.download_button(
+        "Download ALL Run Logs (JSON)",
+        data=json.dumps(payload, indent=2),
+        file_name=f"nextbillion_run_logs_{int(time.time())}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+
+# -----------------------------
+# Request Wrapper (logs everything)
+# -----------------------------
+def nb_request(
+    method: str,
+    path: str,
+    *,
+    key: str,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: int = 60,
+) -> Dict[str, Any]:
+    if not params:
+        params = {}
+    params = dict(params)
+    params["key"] = key  # NextBillion uses key= in query string
+
+    url = f"{NB_BASE}{path}"
+    started = time.time()
+
+    try:
+        resp = requests.request(
+            method=method.upper(),
+            url=url,
+            params=params,
+            json=json_body,
+            timeout=timeout,
+        )
+        elapsed_ms = int((time.time() - started) * 1000)
+
+        # Try JSON, fallback to text
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = None
+
+        log_entry = {
+            "ts_utc": datetime.utcnow().isoformat() + "Z",
+            "method": method.upper(),
+            "url": url,
+            "params": params,
+            "body": json_body,
+            "status": resp.status_code,
+            "elapsed_ms": elapsed_ms,
+            "response_headers": dict(resp.headers),
+            "parsed": parsed,
+            "raw_text": resp.text if parsed is None else None,
+        }
+        add_log(log_entry)
+
+        # Return consistent structure
+        return {
+            "ok": resp.ok,
+            "status": resp.status_code,
+            "data": parsed if parsed is not None else resp.text,
+        }
+
+    except Exception as e:
+        elapsed_ms = int((time.time() - started) * 1000)
+        add_log(
+            {
+                "ts_utc": datetime.utcnow().isoformat() + "Z",
+                "method": method.upper(),
+                "url": url,
+                "params": params,
+                "body": json_body,
+                "status": None,
+                "elapsed_ms": elapsed_ms,
+                "error": str(e),
+            }
+        )
+        return {"ok": False, "status": None, "data": {"error": str(e)}}
+
+
+# -----------------------------
+# Geometry Helpers
+# -----------------------------
+def decode_route_polyline_to_latlng(encoded: str) -> List[Tuple[float, float]]:
+    """
+    NextBillion returns encoded polyline. polyline.decode gives [(lat, lng), ...].
+    This format is what Folium/Leaflet expects for PolyLine.
+    """
+    if not encoded:
+        return []
+    return polyline.decode(encoded)
+
+
+# -----------------------------
+# API Calls (Correct Endpoints)
+# -----------------------------
+def get_isochrone(
+    key: str,
+    lat: float,
+    lng: float,
+    minutes: int = 30,
+    mode: str = "car",
+    polygons: bool = True,
+) -> Dict[str, Any]:
+    # Isochrone is GET /isochrone/json with coordinates=lat,lng (per docs) :contentReference[oaicite:3]{index=3}
+    params = {
+        "coordinates": f"{lat},{lng}",
+        "contours_minutes": str(minutes),
+        "polygons": "true" if polygons else "false",
+        "mode": mode,
+    }
+    return nb_request("GET", "/isochrone/json", key=key, params=params)
+
+
+def snap_to_roads(
+    key: str,
+    points_latlng: List[Tuple[float, float]],
+) -> Dict[str, Any]:
+    # Snap is POST /snapToRoads/json :contentReference[oaicite:4]{index=4}
+    body = {
+        "points": [{"lat": lat, "lng": lng} for lat, lng in points_latlng]
+    }
+    return nb_request("POST", "/snapToRoads/json", key=key, json_body=body)
+
+
+def create_vrp_job(key: str, vrp_payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Create job: POST /optimization/v2?key=... :contentReference[oaicite:5]{index=5}
+    return nb_request("POST", "/optimization/v2", key=key, json_body=vrp_payload)
+
+
+def fetch_vrp_result(key: str, job_id: str) -> Dict[str, Any]:
+    # Fetch result: GET /optimization/v2/result?id=...&key=... :contentReference[oaicite:6]{index=6}
+    return nb_request("GET", "/optimization/v2/result", key=key, params={"id": job_id})
+
+
+def poll_vrp_result(
+    key: str,
+    job_id: str,
+    *,
+    max_attempts: int = 10,
+    sleep_s: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Handles the "Job created, but result not ready yet" situation.
+    We retry a few times, logging every attempt.
+    """
+    last = None
+    for attempt in range(1, max_attempts + 1):
+        last = fetch_vrp_result(key, job_id)
+        if last.get("ok") and isinstance(last.get("data"), dict):
+            # Heuristic: if result exists, we're done
+            if "result" in last["data"] and last["data"]["result"]:
+                return last
+        time.sleep(sleep_s)
+    return last or {"ok": False, "status": None, "data": {"error": "No response"}}
+
+
+# -----------------------------
+# UI: Run Logs Panel
+# -----------------------------
+def render_logs_panel():
+    st.subheader("Run Logs (for debugging)")
+    st.caption("Every API action is captured here. Download and paste the JSON to share a full run.")
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        download_logs_button()
+    with col2:
+        if st.button("Clear logs", use_container_width=True):
+            st.session_state.run_logs = []
+            st.rerun()
+
+    with st.expander(f"View latest logs ({len(st.session_state.run_logs)})", expanded=False):
+        st.json(st.session_state.run_logs[-5:] if st.session_state.run_logs else [])
+
+
+# -----------------------------
+# Example: Route Optimization Screen (minimal + correct)
+# -----------------------------
+def route_optimization_screen():
+    st.header("Route Optimization (VRP)")
+
+    key = st.session_state.api_key.strip()
+    if not key:
+        st.warning("Add your NextBillion API key in the sidebar.")
+        return
+
+    st.write("Paste your VRP payload (JSON) below, then create + fetch results.")
+
+    vrp_text = st.text_area(
+        "VRP Payload JSON",
+        height=250,
+        value=json.dumps(
+            {
+                "locations": {"id": 0, "location": ["-35.616515,-65.299796"]},
+                "jobs": [{"id": 0, "location_index": 0}],
+                "vehicles": [{"id": "vehicle_1", "start_index": 0, "end_index": 0}],
+            },
+            indent=2,
+        ),
+    )
+
+    colA, colB, colC = st.columns([1, 1, 1])
+
+    with colA:
+        if st.button("Create VRP Job", use_container_width=True):
+            try:
+                payload = json.loads(vrp_text)
+            except Exception as e:
+                st.error(f"Invalid JSON: {e}")
+                return
+
+            resp = create_vrp_job(key, payload)
+            st.json(resp["data"])
+
+            if resp["ok"] and isinstance(resp["data"], dict) and resp["data"].get("id"):
+                st.session_state.last_vrp_job_id = resp["data"]["id"]
+                st.success(f"Job created: {st.session_state.last_vrp_job_id}")
+
+    with colB:
+        if st.button("Fetch VRP Result (once)", use_container_width=True):
+            job_id = st.session_state.last_vrp_job_id
+            if not job_id:
+                st.warning("No job_id yet. Create a job first.")
+            else:
+                res = fetch_vrp_result(key, job_id)
+                st.session_state.last_vrp_result = res["data"]
+                st.json(res["data"])
+
+    with colC:
+        if st.button("Fetch VRP Result (retry)", use_container_width=True):
+            job_id = st.session_state.last_vrp_job_id
+            if not job_id:
+                st.warning("No job_id yet. Create a job first.")
+            else:
+                res = poll_vrp_result(key, job_id, max_attempts=12, sleep_s=1.0)
+                st.session_state.last_vrp_result = res["data"]
+                st.json(res["data"])
+
+    st.divider()
+
+    st.subheader("Route Geometry (fixes the ‘straight line’ issue)")
+    st.caption("We decode the route geometry polyline from optimization result and store lat/lng pairs.")
+
+    if st.session_state.last_vrp_result and isinstance(st.session_state.last_vrp_result, dict):
+        data = st.session_state.last_vrp_result
+        try:
+            routes = data["result"]["routes"]
+            if routes and "geometry" in routes[0]:
+                encoded = routes[0]["geometry"]
+                latlng = decode_route_polyline_to_latlng(encoded)
+                st.session_state.last_route_latlng = latlng
+                st.success(f"Decoded {len(latlng)} points (lat,lng). This is what you should plot on the map.")
+                st.write(latlng[:5], " ...")
+            else:
+                st.info("No geometry found in result yet.")
+        except Exception as e:
+            st.error(f"Could not read geometry: {e}")
+
+    st.divider()
+    render_logs_panel()
+
+
+# -----------------------------
+# Sidebar + App Router
+# -----------------------------
+def main():
+    st.set_page_config(page_title="NextBillion Debuggable Console", layout="wide")
+    init_state()
+
+    with st.sidebar:
+        st.title("Settings")
+        st.session_state.api_key = st.text_input("NextBillion API Key", value=st.session_state.api_key, type="password")
+
+        st.caption("Tip: After any run, download the full logs JSON and share it.")
+
+        if st.session_state.last_vrp_job_id:
+            st.info(f"Last VRP job_id:\n{st.session_state.last_vrp_job_id}")
+
+    route_optimization_screen()
+
+
+if __name__ == "__main__":
+    main()
+
