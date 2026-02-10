@@ -22,6 +22,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import folium
+import polyline
 from folium.plugins import PolyLineTextPath
 from streamlit_folium import st_folium
 
