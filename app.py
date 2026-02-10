@@ -1,14 +1,13 @@
 # app.py
 # NextBillion.ai — Visual API Tester (stable maps + 20+ stops + before/after optimize)
-# FIXES:
-# - Removes hard dependency on `polyline` (fixes ModuleNotFoundError)
-# - PolyLineTextPath import is optional (fixes folium.plugins crash)
-# - Replaces use_container_width=True with width="stretch" (Streamlit deprecation)
-# - Avoids pandas concat warning (safe append)
-# - Adds downloadable JSON logs for ALL actions (entire run) + last call + saved bundles
-#
-# References:
-# Streamlit deprecating use_container_width -> width="stretch" :contentReference[oaicite:1]{index=1}
+# FIXES (this version):
+# - Remove polyline dependency (fix ModuleNotFoundError)
+# - Make PolyLineTextPath optional (fix folium.plugins import errors)
+# - Replace use_container_width -> width="stretch" (Streamlit deprecation)
+# - Fix Isochrone: use GET /isochrone/json with coordinates + contours_* (per docs)
+# - Render isochrone GeoJSON on map
+# - Places: Reverse geocode writes to address column reliably (dtype safe)
+# - Snap-to-road: defensive parsing and UI-safe response display
 
 from __future__ import annotations
 
@@ -16,7 +15,6 @@ import json
 import math
 import random
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,12 +24,11 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 
-# Optional: folium arrow text along the polyline
+# Optional: some folium versions do not include this plugin
 try:
-    from folium.plugins import PolyLineTextPath  # optional
+    from folium.plugins import PolyLineTextPath  # type: ignore
 except Exception:
-    PolyLineTextPath = None
-
+    PolyLineTextPath = None  # arrows will be disabled
 
 # -----------------------------
 # CONFIG
@@ -42,20 +39,17 @@ NB_BASE = "https://api.nextbillion.io"
 st.set_page_config(page_title="NextBillion.ai — Visual API Tester", layout="wide")
 YESNO = ["No", "Yes"]
 
-
 # -----------------------------
 # HELPERS
 # -----------------------------
 def _now_unix() -> int:
     return int(time.time())
 
-
 def unix_to_human(ts: int) -> str:
     try:
         return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     except Exception:
         return str(ts)
-
 
 def normalize_latlng(lat: Any, lng: Any) -> Tuple[Optional[float], Optional[float]]:
     try:
@@ -69,15 +63,8 @@ def normalize_latlng(lat: Any, lng: Any) -> Tuple[Optional[float], Optional[floa
     except Exception:
         return None, None
 
-
 def latlng_str(lat: float, lng: float) -> str:
     return f"{lat:.6f},{lng:.6f}"
-
-
-def unique_key(prefix: str) -> str:
-    st.session_state["_key_seq"] = st.session_state.get("_key_seq", 0) + 1
-    return f"{prefix}_{st.session_state['_key_seq']}"
-
 
 def safe_json_loads(s: str) -> Optional[Any]:
     s = (s or "").strip()
@@ -88,7 +75,6 @@ def safe_json_loads(s: str) -> Optional[Any]:
     except Exception as e:
         st.error(f"Invalid JSON override: {e}")
         return None
-
 
 def deep_merge(a: Any, b: Any) -> Any:
     """Merge b into a (dicts only), returning new merged object."""
@@ -101,15 +87,6 @@ def deep_merge(a: Any, b: Any) -> Any:
                 out[k] = v
         return out
     return b
-
-
-def json_bytes(obj: Any) -> bytes:
-    return json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8")
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 # -----------------------------
 # STATE
@@ -133,14 +110,16 @@ def ensure_state():
     if "last_json" not in ss:
         ss.last_json = {}
     if "last_http" not in ss:
-        ss.last_http = {}
-    if "action_log" not in ss:
-        ss.action_log = []  # ALL API calls in this run
-
+        ss.last_http = {}  # last request/response debug
+    if "_region_candidates" not in ss:
+        ss._region_candidates = []
+    if "_optimized_stops" not in ss:
+        ss._optimized_stops = None
+    if "iso_geojson" not in ss:
+        ss.iso_geojson = None
 
 ensure_state()
 ss = st.session_state
-
 
 def set_center(lat: float, lng: float, country: str | None = None):
     ss.center["lat"] = float(lat)
@@ -148,37 +127,40 @@ def set_center(lat: float, lng: float, country: str | None = None):
     if country:
         ss.center["country"] = country
 
-
-def _append_stop_row(df: pd.DataFrame, row: Dict[str, Any]) -> pd.DataFrame:
-    # avoids pandas concat FutureWarning by doing index-based assignment
-    next_i = len(df)
-    for col in ["label", "address", "lat", "lng", "source"]:
-        if col not in row:
-            row[col] = None
-    df.loc[next_i] = [row["label"], row["address"], row["lat"], row["lng"], row["source"]]
-    return df
-
-
 def add_stops(rows: List[Dict[str, Any]], source: str):
     df = ss.stops_df.copy()
+    # Ensure address column stays string-like
+    if "address" in df.columns:
+        df["address"] = df["address"].astype("string")
+
     for r in rows:
-        label = r.get("label") or r.get("name") or f"Stop {len(df) + 1}"
+        label = r.get("label") or r.get("name") or f"Stop {len(df)+1}"
         addr = r.get("address") or r.get("name") or ""
         lat = r.get("lat")
         lng = r.get("lng")
         lat_f, lng_f = normalize_latlng(lat, lng)
         if lat_f is None:
             continue
-        df = _append_stop_row(
-            df,
-            {"label": str(label), "address": str(addr), "lat": lat_f, "lng": lng_f, "source": source},
+
+        df = pd.concat(
+            [df, pd.DataFrame([{
+                "label": str(label),
+                "address": str(addr),
+                "lat": lat_f,
+                "lng": lng_f,
+                "source": source
+            }])],
+            ignore_index=True,
         )
+
     ss.stops_df = df.reset_index(drop=True)
 
-
 def replace_stops(df_new: pd.DataFrame):
-    ss.stops_df = df_new.reset_index(drop=True)
-
+    # keep types stable
+    df = df_new.copy()
+    if "address" in df.columns:
+        df["address"] = df["address"].astype("string")
+    ss.stops_df = df.reset_index(drop=True)
 
 def clear_stops():
     ss.stops_df = pd.DataFrame(columns=["label", "address", "lat", "lng", "source"])
@@ -187,35 +169,23 @@ def clear_stops():
     ss.vrp = {"create": None, "result": None, "order": None, "job_id": None}
     ss.last_json = {}
     ss.last_http = {}
-    ss.action_log = []
-
+    ss.iso_geojson = None
 
 # -----------------------------
-# HTTP (debuggable + logged + downloadable)
+# HTTP (debuggable)
 # -----------------------------
-def _http(
-    method: str,
-    path: str,
-    params: Dict[str, Any] | None = None,
-    body: Dict[str, Any] | None = None,
-    timeout: int = 60,
-    nocache: bool = False,
-) -> Tuple[int, Any, str]:
+def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None, timeout: int = 60, nocache: bool = False) -> Tuple[int, Any, str]:
     """
     Returns (status_code, parsed_json_or_text, raw_text)
     Stores request/response in ss.last_http for debugging.
-    Appends to ss.action_log for downloadable end-to-end logs.
     """
     url = NB_BASE + path
     params = params or {}
     headers = {"accept": "application/json"}
 
-    # Avoid caching on "result fetch" etc by adding a _ts param if requested
     if nocache:
         params = dict(params)
         params["_ts"] = int(time.time() * 1000)
-
-    started = utc_now_iso()
 
     try:
         if method.upper() == "GET":
@@ -225,17 +195,14 @@ def _http(
             r = requests.post(url, params=params, json=body or {}, headers=headers, timeout=timeout)
 
         raw = r.text or ""
-        parsed: Any
         try:
-            parsed = r.json()
+            parsed: Any = r.json()
         except Exception:
             parsed = raw
 
         ss.last_http = {
-            "ts_utc": started,
             "method": method.upper(),
             "url": url,
-            "path": path,
             "params": params,
             "body": body,
             "status": r.status_code,
@@ -243,38 +210,19 @@ def _http(
             "raw_text": raw[:20000],
             "parsed": parsed,
         }
-
-        # Full run log entry (kept smaller than raw)
-        ss.action_log.append(
-            {
-                "ts_utc": started,
-                "method": method.upper(),
-                "url": url,
-                "path": path,
-                "params": params,
-                "body": body,
-                "status": r.status_code,
-                "parsed": parsed,
-            }
-        )
-
         return r.status_code, parsed, raw
 
     except Exception as e:
-        ss.last_http = {"ts_utc": started, "error": str(e), "method": method.upper(), "url": url, "path": path, "params": params, "body": body}
-        ss.action_log.append({"ts_utc": started, "error": str(e), "method": method.upper(), "url": url, "path": path, "params": params, "body": body})
+        ss.last_http = {"error": str(e), "method": method.upper(), "url": url, "params": params, "body": body}
         return 0, {"error": str(e)}, str(e)
-
 
 def nb_get(path: str, params: Dict[str, Any], *, nocache: bool = False) -> Tuple[int, Any]:
     stt, parsed, _ = _http("GET", path, params=params, body=None, nocache=nocache)
     return stt, parsed
 
-
 def nb_post(path: str, params: Dict[str, Any], body: Dict[str, Any], *, nocache: bool = False) -> Tuple[int, Any]:
     stt, parsed, _ = _http("POST", path, params=params, body=body, nocache=nocache)
     return stt, parsed
-
 
 # -----------------------------
 # PARSERS
@@ -326,11 +274,7 @@ def extract_geocode_candidates(resp: Any) -> List[Dict[str, Any]]:
 
     return out
 
-
 def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, float]]:
-    """
-    Local polyline decode (no external `polyline` dependency).
-    """
     if not isinstance(polyline_str, str):
         return []
     polyline_str = polyline_str.strip()
@@ -380,12 +324,11 @@ def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, 
 
     return coordinates
 
-
 def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
     if not isinstance(resp, dict):
         return []
 
-    # GeoJSON
+    # GeoJSON FeatureCollection
     if resp.get("type") == "FeatureCollection" and "features" in resp:
         for f in resp["features"]:
             geom = (f or {}).get("geometry") or {}
@@ -410,7 +353,6 @@ def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
     r0 = routes[0] if isinstance(routes[0], dict) else {}
     poly = r0.get("geometry") or r0.get("polyline") or (r0.get("overview_polyline") or {}).get("points")
 
-    # polyline string
     if isinstance(poly, str) and poly.strip():
         pts5 = decode_polyline(poly, precision=5)
         pts6 = decode_polyline(poly, precision=6)
@@ -418,7 +360,6 @@ def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
         if len(pts) >= 2:
             return pts
 
-    # list geometry
     geom = r0.get("geometry")
     if isinstance(geom, list):
         pts = []
@@ -436,7 +377,6 @@ def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
 
     return []
 
-
 def parse_distance_duration_from_directions(resp: Any) -> Tuple[Optional[float], Optional[float]]:
     if not isinstance(resp, dict):
         return None, None
@@ -453,25 +393,17 @@ def parse_distance_duration_from_directions(resp: Any) -> Tuple[Optional[float],
                 return None
             if isinstance(v, (int, float)):
                 return float(v)
-            if isinstance(v, dict):
-                if "value" in v and isinstance(v["value"], (int, float, str)):
-                    return float(v["value"])
+            if isinstance(v, dict) and "value" in v:
+                return float(v["value"])
             if isinstance(v, str) and v.strip():
                 return float(v)
         except Exception:
             return None
         return None
 
-    dist = _num(r0.get("distance"))
-    dur = _num(r0.get("duration"))
-
-    if dist is None:
-        dist = _num(r0.get("distanceMeters") or r0.get("distance_meters"))
-    if dur is None:
-        dur = _num(r0.get("durationSeconds") or r0.get("duration_seconds"))
-
+    dist = _num(r0.get("distance")) or _num(r0.get("distanceMeters") or r0.get("distance_meters"))
+    dur = _num(r0.get("duration")) or _num(r0.get("durationSeconds") or r0.get("duration_seconds"))
     return dist, dur
-
 
 # -----------------------------
 # MAP RENDERING
@@ -482,8 +414,16 @@ def make_map(
     route_pts: Optional[List[Tuple[float, float]]] = None,
     clicked: Optional[Tuple[float, float]] = None,
     zoom: int = 12,
+    geojson: Any = None,
 ) -> folium.Map:
     m = folium.Map(location=[center[0], center[1]], zoom_start=zoom, control_scale=True, tiles="OpenStreetMap")
+
+    # Isochrone / GeoJSON overlay
+    if geojson is not None:
+        try:
+            folium.GeoJson(geojson, name="isochrone").add_to(m)
+        except Exception:
+            pass
 
     if clicked is not None:
         folium.Marker(
@@ -516,7 +456,7 @@ def make_map(
     if route_pts and len(route_pts) >= 2:
         folium.PolyLine(route_pts, weight=5, opacity=0.8).add_to(m)
 
-        # Optional arrows
+        # Direction arrows (only if plugin exists)
         if PolyLineTextPath is not None:
             try:
                 pl = folium.PolyLine(route_pts, weight=0, opacity=0)
@@ -525,16 +465,17 @@ def make_map(
             except Exception:
                 pass
 
-        lats = [p[0] for p in route_pts]
-        lngs = [p[1] for p in route_pts]
-        m.fit_bounds([[min(lats), min(lngs)], [max(lats), max(lngs)]])
+        try:
+            lats = [p[0] for p in route_pts]
+            lngs = [p[1] for p in route_pts]
+            m.fit_bounds([[min(lats), min(lngs)], [max(lats), max(lngs)]])
+        except Exception:
+            pass
 
     return m
 
-
 def render_map(m: folium.Map, key: str) -> Dict[str, Any]:
     return st_folium(m, height=520, width="stretch", key=key)
-
 
 # -----------------------------
 # API BUILDERS
@@ -560,7 +501,6 @@ def build_global_route_params(ui: Dict[str, Any]) -> Dict[str, Any]:
         p["overview"] = ui["overview"]
     return p
 
-
 def geocode_forward(query: str, country: str, language: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY, "q": query, "country": country, "language": language}
     stt, data = nb_get("/geocode", params=params)
@@ -568,14 +508,12 @@ def geocode_forward(query: str, country: str, language: str) -> Tuple[int, Any]:
         stt, data = nb_get("/geocode/v1", params=params)
     return stt, data
 
-
 def geocode_reverse(lat: float, lng: float, language: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY, "lat": lat, "lng": lng, "language": language}
     stt, data = nb_get("/reverse", params=params)
     if stt == 404:
         stt, data = nb_get("/reverse/v1", params=params)
     return stt, data
-
 
 def distance_matrix(origins: List[str], destinations: List[str], params_extra: Dict[str, Any]) -> Tuple[int, Any]:
     params = dict(params_extra)
@@ -586,7 +524,6 @@ def distance_matrix(origins: List[str], destinations: List[str], params_extra: D
     if stt == 404:
         stt, data = nb_get("/distancematrix/v2", params=params)
     return stt, data
-
 
 def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any], override_params: Dict[str, Any] | None = None) -> Tuple[int, Any]:
     if len(order_latlng) < 2:
@@ -612,9 +549,8 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any],
         stt, data = nb_get("/navigation/v2", params=params)
     return stt, data
 
-
 # -----------------------------
-# VRP v2 (FIXED PAYLOAD SHAPE)
+# VRP v2 (payload shape correct)
 # -----------------------------
 def build_vrp_payload_v2(stops: pd.DataFrame, objective: str, routing_mode: str, traffic_ts: int) -> Dict[str, Any]:
     loc_list: List[str] = []
@@ -627,11 +563,10 @@ def build_vrp_payload_v2(stops: pd.DataFrame, objective: str, routing_mode: str,
         "vehicles": [{"id": "vehicle_1", "start_index": 0, "end_index": 0}],
         "options": {
             "objective": {"travel_cost": objective},
-            "routing": {"mode": routing_mode, "traffic_timestamp": int(traffic_ts)},
-        },
+            "routing": {"mode": routing_mode, "traffic_timestamp": int(traffic_ts)}
+        }
     }
     return payload
-
 
 def validate_vrp_payload_v2(body: Dict[str, Any]) -> Tuple[bool, str]:
     locs = body.get("locations")
@@ -642,7 +577,6 @@ def validate_vrp_payload_v2(body: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "VRP payload invalid: locations.location must be a non-empty array of 'lat,lng' strings."
     return True, "OK"
 
-
 def vrp_create_v2(body: Dict[str, Any]) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY}
     stt, data = nb_post("/optimization/v2", params=params, body=body)
@@ -650,13 +584,11 @@ def vrp_create_v2(body: Dict[str, Any]) -> Tuple[int, Any]:
     ss.last_json["vrp_create_response"] = data
     return stt, data
 
-
 def vrp_result_v2(job_id: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY, "id": job_id}
     stt, data = nb_get("/optimization/v2/result", params=params, nocache=True)
     ss.last_json["vrp_result_response"] = data
     return stt, data
-
 
 def parse_vrp_order(resp: Any) -> Optional[List[int]]:
     if not isinstance(resp, dict):
@@ -703,118 +635,49 @@ def parse_vrp_order(resp: Any) -> Optional[List[int]]:
 
     return None
 
-
 # -----------------------------
 # SNAP + ISO
 # -----------------------------
-def _downsample_points(points: List[Tuple[float, float]], max_points: int = 200) -> List[Tuple[float, float]]:
-    if len(points) <= max_points:
-        return points
-    step = math.ceil(len(points) / max_points)
-    pts = points[::step]
-    # keep last point
-    if pts[-1] != points[-1]:
-        pts.append(points[-1])
-    return pts
-
 def snap_to_road(points: List[Tuple[float, float]]) -> Tuple[int, Any]:
-    """
-    NextBillion SnapToRoads expects:
-      POST /snapToRoads/json with body: {"path": "lat,lng|lat,lng|..."}
-    413 happens when the path is too large -> downsample.
-    """
     params = {"key": NB_API_KEY}
-
-    pts = _downsample_points(points, max_points=200)  # keep under typical waypoint limits
-    path = "|".join([f"{p[0]:.6f},{p[1]:.6f}" for p in pts])
-
-    body = {
-        "path": path,
-        "geometry": "geojson",  # nice for map rendering when present
-    }
-
+    body = {"points": [{"lat": p[0], "lng": p[1]} for p in points]}
     ss.last_json["snap_payload"] = body
 
-    # Correct endpoint
-    stt, data = nb_post("/snapToRoads/json", params=params, body=body)
+    stt, data = nb_post("/snapToRoad/v2", params=params, body=body)
     if stt == 404:
-        stt, data = nb_post("/snapToRoads", params=params, body=body)
+        stt, data = nb_post("/snaptoroad/v2", params=params, body=body)
+    if stt == 404:
+        stt, data = nb_post("/snapToRoad", params=params, body=body)
 
     ss.last_json["snap_response"] = data
-
-    # Make 413/422 understandable in UI
-    if stt == 413:
-        # Your logs show this exact failure string
-        data = {
-            "status": "413",
-            "msg": "Snap request too large (413). Try fewer geometry points (e.g., 50–150) or let the app downsample more.",
-            "detail": data,
-        }
-    if stt == 422:
-        data = {
-            "status": "422",
-            "msg": "At least one coordinate cannot be snapped to the street. Try fewer points, a different route segment, or a different mode.",
-            "detail": data,
-        }
-
     return stt, data
 
 def isochrone(center_lat: float, center_lng: float, iso_type: str, iso_val: int, iso_mode: str) -> Tuple[int, Any]:
-    """
-    NextBillion Isochrone API expects Mapbox-style fields:
-      - coordinates="lat,lng"
-      - contours_minutes OR contours_meters
-    """
-    params = {"key": NB_API_KEY}
-
-    # IMPORTANT: coordinates is "lat,lng" (your logs show this is what works)
-    req: Dict[str, Any] = {
-        "coordinates": f"{float(center_lat):.6f},{float(center_lng):.6f}",
+    # Per NextBillion Isochrone docs: HTTPS GET /isochrone/json with coordinates + contours_* :contentReference[oaicite:2]{index=2}
+    params: Dict[str, Any] = {
+        "key": NB_API_KEY,
+        "coordinates": f"{float(center_lat)},{float(center_lng)}",
         "mode": iso_mode,
     }
 
     if iso_type == "time":
-        # UI gives seconds; API wants minutes (your successful payload used contours_minutes=5)
-        req["contours_minutes"] = max(1, int(round(int(iso_val) / 60)))
+        params["contours_minutes"] = max(1, int(round(iso_val / 60)))
     else:
-        req["contours_meters"] = max(50, int(iso_val))
+        params["contours_meters"] = int(iso_val)
 
-    ss.last_json["iso_payload"] = {**params, **req}
-
-    # Isochrone is /isochrone/json (not /isochrone/v2 with center payload)
-    stt, data = nb_post("/isochrone/json", params=params, body=req)
+    ss.last_json["iso_params"] = params
+    stt, data = nb_get("/isochrone/json", params=params)
     if stt == 404:
-        stt, data = nb_post("/isochrone", params=params, body=req)
+        stt, data = nb_get("/isochrone/v2", params=params)  # fallback if enabled
 
     ss.last_json["iso_response"] = data
     return stt, data
-
 
 # -----------------------------
 # UI
 # -----------------------------
 st.title("NextBillion.ai — Visual API Tester")
 st.caption(f"Stops loaded: {len(ss.stops_df)}")
-
-with st.expander("⬇️ Downloads (Run Logs)", expanded=False):
-    st.download_button(
-        "Download FULL Run Log (all API calls)",
-        data=json_bytes(ss.action_log),
-        file_name=f"nextbillion_run_log_{int(time.time())}.json",
-        mime="application/json",
-    )
-    st.download_button(
-        "Download LAST API Call (request+response)",
-        data=json_bytes(ss.last_http or {}),
-        file_name=f"nextbillion_last_call_{int(time.time())}.json",
-        mime="application/json",
-    )
-    st.download_button(
-        "Download Saved JSON Bundle (ss.last_json)",
-        data=json_bytes(ss.last_json or {}),
-        file_name=f"nextbillion_saved_bundle_{int(time.time())}.json",
-        mime="application/json",
-    )
 
 with st.expander("Global route options (Directions / Matrix / Optimize)", expanded=False):
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
@@ -866,17 +729,15 @@ with st.sidebar:
             lines = [x.strip() for x in (paste or "").splitlines() if x.strip()]
             if input_mode.startswith("Addresses"):
                 df = ss.stops_df.copy()
+                df["address"] = df["address"].astype("string")
                 for addr in lines:
-                    df = _append_stop_row(
-                        df,
-                        {
-                            "label": f"Stop {len(df)+1}",
-                            "address": addr,
-                            "lat": None,
-                            "lng": None,
-                            "source": "Pasted address",
-                        },
-                    )
+                    df = pd.concat([df, pd.DataFrame([{
+                        "label": f"Stop {len(df)+1}",
+                        "address": addr,
+                        "lat": None,
+                        "lng": None,
+                        "source": "Pasted address",
+                    }])], ignore_index=True)
                 ss.stops_df = df.reset_index(drop=True)
             else:
                 rows = []
@@ -960,6 +821,7 @@ with tabs[1]:
         status, resp = geocode_forward(region_q, country=pl_country.strip().upper()[:3], language=language)
         ss.last_json["region_search_response"] = resp
         ss._region_candidates = extract_geocode_candidates(resp)
+
     candidates = ss.get("_region_candidates", [])
 
     if candidates:
@@ -1005,50 +867,30 @@ with tabs[1]:
             pts.append((center_lat + dlat, center_lng + dlng))
         return pts
 
-    def extract_best_address_label(resp: Any) -> str:
-
-            if isinstance(resp, dict):
-                items = resp.get("items")
-            if isinstance(items, list) and items:
-                addr = (items[0] or {}).get("address") or {}
-            if isinstance(addr, dict) and addr.get("label"):
-                    return str(addr["label"])
-            # fallback to title/name if label absent
-                if (items[0] or {}).get("title"):
-                    return str((items[0] or {})["title"])
-
-    cands = extract_geocode_candidates(resp)
-    if cands:
-        return str(cands[0].get("name") or "")
-    return ""
-
     if st.button("🎲 Generate random stops around center", key="pl_gen_random", width="stretch"):
         pts = gen_random_points(float(ss.center["lat"]), float(ss.center["lng"]), int(n_rand), int(radius_m), int(seed))
         rows = [{"label": f"Rand {i}", "address": "", "lat": la, "lng": ln} for i, (la, ln) in enumerate(pts, start=1)]
         add_stops(rows, "Random around center")
 
+        # Resolve addresses (reverse geocode) — FIXED indentation + dtype safety
         if resolve_addr == "Yes":
             df = ss.stops_df.copy()
-
-    # reverse-geocode ONLY the newly generated random rows
-    mask = df["source"].astype(str).str.contains("Random around center", na=False)
-            for idx, row in df[mask].iterrows():
-                if str(row.get("address") or "").strip():
+            df["address"] = df["address"].astype("string")
+            for idx, row in df[df["source"].str.contains("Random around center", na=False)].iterrows():
+                try:
+                    status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
+                    cand = extract_geocode_candidates(rresp)
+                    if cand:
+                        df.loc[idx, "address"] = str(cand[0]["name"])
+                        df.loc[idx, "source"] = f"Reverse-geocode ({status})"
+                except Exception:
                     continue
-
-            status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
-            ss.last_json.setdefault("reverse_geocode_samples", []).append({"status": status, "resp": rresp})
-
-            label = extract_best_address_label(rresp)
-                if label:
-                    df.loc[idx, "address"] = label
-                    df.loc[idx, "source"] = f"Reverse-geocode ({status})"
-        else:
-                    df.loc[idx, "source"] = f"Reverse-geocode no label ({status})"
-
             replace_stops(df)
 
-    ss.mapsig["places"] += 1
+        ss.mapsig["places"] += 1
+
+    st.markdown("### Stops table")
+    st.dataframe(ss.stops_df, width="stretch", height=260)
 
 # -----------------------------
 # TAB 3: ROUTE + OPTIMIZE
@@ -1169,7 +1011,7 @@ with tabs[2]:
                         order = parse_vrp_order(rr)
                         ss.vrp["order"] = order
                         if not order:
-                            st.warning("Result fetched, but order not found yet (or schema differs). Try again in a few seconds.")
+                            st.warning("Result fetched, but order not found yet. Try again in a few seconds.")
                         else:
                             st.success(f"Order parsed with {len(order)} stops.")
 
@@ -1335,16 +1177,13 @@ with tabs[4]:
                 ss.mapsig["snap"] += 1
                 if stt != 200:
                     st.error(f"Snap-to-road failed: HTTP {stt}")
-                    st.json(data)
-                else:
-                    st.success("Snap-to-road response received.")
-                    st.json(data)
+                st.json(data)
 
         m5 = make_map(center=(float(ss.center["lat"]), float(ss.center["lng"])), stops=ss.stops_df, route_pts=coords[: int(n_path)] if coords else None, clicked=ss.clicked_pin, zoom=12)
         render_map(m5, key=f"map_snap_{ss.mapsig['snap']}")
 
     with s2:
-        st.markdown("### Isochrone (best-effort)")
+        st.markdown("### Isochrone (GET /isochrone/json)")
         iso_type = st.selectbox("Type", ["time", "distance"], index=0, key="iso_type")
         iso_mode = st.selectbox("Mode", ["car", "truck", "bike", "walk"], index=0, key="iso_mode")
         iso_val = st.number_input("Value (seconds if time, meters if distance)", min_value=60, max_value=2000000, value=1800, step=60, key="iso_val")
@@ -1354,12 +1193,19 @@ with tabs[4]:
             ss.mapsig["iso"] += 1
             if stt != 200:
                 st.error(f"Isochrone failed: HTTP {stt}")
-                st.json(data)
+                ss.iso_geojson = None
             else:
+                ss.iso_geojson = data if isinstance(data, dict) and data.get("type") == "FeatureCollection" else None
                 st.success("Isochrone response received.")
-                st.json(data)
+            st.json(data)
 
-        m6 = make_map(center=(float(ss.center["lat"]), float(ss.center["lng"])), stops=ss.stops_df, clicked=ss.clicked_pin, zoom=12)
+        m6 = make_map(
+            center=(float(ss.center["lat"]), float(ss.center["lng"])),
+            stops=ss.stops_df,
+            clicked=ss.clicked_pin,
+            zoom=12,
+            geojson=ss.iso_geojson,
+        )
         render_map(m6, key=f"map_iso_{ss.mapsig['iso']}")
 
 # -----------------------------
@@ -1372,30 +1218,5 @@ with tabs[5]:
     else:
         st.json(ss.last_http)
 
-    st.download_button(
-        "Download LAST API Call JSON",
-        data=json_bytes(ss.last_http or {}),
-        file_name=f"nextbillion_last_call_{int(time.time())}.json",
-        mime="application/json",
-    )
-
     st.markdown("### Saved JSON bundles")
     st.json(ss.last_json)
-
-    st.download_button(
-        "Download Saved Bundle (ss.last_json)",
-        data=json_bytes(ss.last_json or {}),
-        file_name=f"nextbillion_saved_bundle_{int(time.time())}.json",
-        mime="application/json",
-    )
-
-    st.markdown("### Full run log (all API actions)")
-    st.caption(f"Logged API actions: {len(ss.action_log)}")
-    st.json(ss.action_log[-10:] if ss.action_log else [])  # show last 10 only
-
-    st.download_button(
-        "Download FULL Run Log (all API calls)",
-        data=json_bytes(ss.action_log),
-        file_name=f"nextbillion_run_log_{int(time.time())}.json",
-        mime="application/json",
-    )
