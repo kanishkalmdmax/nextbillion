@@ -1006,18 +1006,15 @@ with tabs[1]:
         return pts
 
     def extract_best_address_label(resp: Any) -> str:
-    """
-    Reverse geocode often returns items[0].address.label.
-    Fall back to any candidate name we can extract.
-    """
-    if isinstance(resp, dict):
-        items = resp.get("items")
-        if isinstance(items, list) and items:
+
+            if isinstance(resp, dict):
+            items = resp.get("items")
+            if isinstance(items, list) and items:
             addr = (items[0] or {}).get("address") or {}
             if isinstance(addr, dict) and addr.get("label"):
                 return str(addr["label"])
             # fallback to title/name if label absent
-            if (items[0] or {}).get("title"):
+                if (items[0] or {}).get("title"):
                 return str((items[0] or {})["title"])
 
     cands = extract_geocode_candidates(resp)
