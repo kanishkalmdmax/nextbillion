@@ -1005,22 +1005,51 @@ with tabs[1]:
             pts.append((center_lat + dlat, center_lng + dlng))
         return pts
 
+    def extract_best_address_label(resp: Any) -> str:
+    """
+    Reverse geocode often returns items[0].address.label.
+    Fall back to any candidate name we can extract.
+    """
+    if isinstance(resp, dict):
+        items = resp.get("items")
+        if isinstance(items, list) and items:
+            addr = (items[0] or {}).get("address") or {}
+            if isinstance(addr, dict) and addr.get("label"):
+                return str(addr["label"])
+            # fallback to title/name if label absent
+            if (items[0] or {}).get("title"):
+                return str((items[0] or {})["title"])
+
+    cands = extract_geocode_candidates(resp)
+    if cands:
+        return str(cands[0].get("name") or "")
+    return ""
+
     if st.button("🎲 Generate random stops around center", key="pl_gen_random", width="stretch"):
         pts = gen_random_points(float(ss.center["lat"]), float(ss.center["lng"]), int(n_rand), int(radius_m), int(seed))
         rows = [{"label": f"Rand {i}", "address": "", "lat": la, "lng": ln} for i, (la, ln) in enumerate(pts, start=1)]
         add_stops(rows, "Random around center")
 
         if resolve_addr == "Yes":
-            df = ss.stops_df.copy()
-            for idx, row in df[df["source"].str.contains("Random", na=False)].iterrows():
-                if str(row.get("address") or "").strip():
-                    continue
-                status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
-                cand = extract_geocode_candidates(rresp)
-                if cand:
-                    df.loc[idx, "address"] = cand[0]["name"]
-                    df.loc[idx, "source"] = f"Reverse-geocode ({status})"
-            replace_stops(df)
+    df = ss.stops_df.copy()
+
+    # reverse-geocode ONLY the newly generated random rows
+    mask = df["source"].astype(str).str.contains("Random around center", na=False)
+    for idx, row in df[mask].iterrows():
+        if str(row.get("address") or "").strip():
+            continue
+
+        status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
+        ss.last_json.setdefault("reverse_geocode_samples", []).append({"status": status, "resp": rresp})
+
+        label = extract_best_address_label(rresp)
+        if label:
+            df.loc[idx, "address"] = label
+            df.loc[idx, "source"] = f"Reverse-geocode ({status})"
+        else:
+            df.loc[idx, "source"] = f"Reverse-geocode no label ({status})"
+
+    replace_stops(df)
 
         ss.mapsig["places"] += 1
 
