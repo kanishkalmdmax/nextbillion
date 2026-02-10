@@ -1008,9 +1008,9 @@ with tabs[1]:
     def extract_best_address_label(resp: Any) -> str:
 
             if isinstance(resp, dict):
-            items = resp.get("items")
+                items = resp.get("items")
             if isinstance(items, list) and items:
-            addr = (items[0] or {}).get("address") or {}
+                addr = (items[0] or {}).get("address") or {}
             if isinstance(addr, dict) and addr.get("label"):
                 return str(addr["label"])
             # fallback to title/name if label absent
@@ -1028,27 +1028,27 @@ with tabs[1]:
         add_stops(rows, "Random around center")
 
         if resolve_addr == "Yes":
-    df = ss.stops_df.copy()
+            df = ss.stops_df.copy()
 
     # reverse-geocode ONLY the newly generated random rows
     mask = df["source"].astype(str).str.contains("Random around center", na=False)
-    for idx, row in df[mask].iterrows():
-        if str(row.get("address") or "").strip():
-            continue
+            for idx, row in df[mask].iterrows():
+                if str(row.get("address") or "").strip():
+                    continue
 
-        status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
-        ss.last_json.setdefault("reverse_geocode_samples", []).append({"status": status, "resp": rresp})
+            status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
+            ss.last_json.setdefault("reverse_geocode_samples", []).append({"status": status, "resp": rresp})
 
-        label = extract_best_address_label(rresp)
-        if label:
-            df.loc[idx, "address"] = label
-            df.loc[idx, "source"] = f"Reverse-geocode ({status})"
+            label = extract_best_address_label(rresp)
+                if label:
+                    df.loc[idx, "address"] = label
+                    df.loc[idx, "source"] = f"Reverse-geocode ({status})"
         else:
-            df.loc[idx, "source"] = f"Reverse-geocode no label ({status})"
+                    df.loc[idx, "source"] = f"Reverse-geocode no label ({status})"
 
-    replace_stops(df)
+            replace_stops(df)
 
-        ss.mapsig["places"] += 1
+    ss.mapsig["places"] += 1
 
 # -----------------------------
 # TAB 3: ROUTE + OPTIMIZE
