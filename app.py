@@ -1012,10 +1012,10 @@ with tabs[1]:
             if isinstance(items, list) and items:
                 addr = (items[0] or {}).get("address") or {}
             if isinstance(addr, dict) and addr.get("label"):
-                return str(addr["label"])
+                    return str(addr["label"])
             # fallback to title/name if label absent
                 if (items[0] or {}).get("title"):
-                return str((items[0] or {})["title"])
+                    return str((items[0] or {})["title"])
 
     cands = extract_geocode_candidates(resp)
     if cands:
