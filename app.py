@@ -707,28 +707,85 @@ def parse_vrp_order(resp: Any) -> Optional[List[int]]:
 # -----------------------------
 # SNAP + ISO
 # -----------------------------
+def _downsample_points(points: List[Tuple[float, float]], max_points: int = 200) -> List[Tuple[float, float]]:
+    if len(points) <= max_points:
+        return points
+    step = math.ceil(len(points) / max_points)
+    pts = points[::step]
+    # keep last point
+    if pts[-1] != points[-1]:
+        pts.append(points[-1])
+    return pts
+
 def snap_to_road(points: List[Tuple[float, float]]) -> Tuple[int, Any]:
+    """
+    NextBillion SnapToRoads expects:
+      POST /snapToRoads/json with body: {"path": "lat,lng|lat,lng|..."}
+    413 happens when the path is too large -> downsample.
+    """
     params = {"key": NB_API_KEY}
-    body = {"points": [{"lat": p[0], "lng": p[1]} for p in points]}
+
+    pts = _downsample_points(points, max_points=200)  # keep under typical waypoint limits
+    path = "|".join([f"{p[0]:.6f},{p[1]:.6f}" for p in pts])
+
+    body = {
+        "path": path,
+        "geometry": "geojson",  # nice for map rendering when present
+    }
+
     ss.last_json["snap_payload"] = body
 
-    stt, data = nb_post("/snapToRoad/v2", params=params, body=body)
+    # Correct endpoint
+    stt, data = nb_post("/snapToRoads/json", params=params, body=body)
     if stt == 404:
-        stt, data = nb_post("/snaptoroad/v2", params=params, body=body)
-    if stt == 404:
-        stt, data = nb_post("/snapToRoad", params=params, body=body)
+        stt, data = nb_post("/snapToRoads", params=params, body=body)
 
     ss.last_json["snap_response"] = data
+
+    # Make 413/422 understandable in UI
+    if stt == 413:
+        # Your logs show this exact failure string
+        data = {
+            "status": "413",
+            "msg": "Snap request too large (413). Try fewer geometry points (e.g., 50–150) or let the app downsample more.",
+            "detail": data,
+        }
+    if stt == 422:
+        data = {
+            "status": "422",
+            "msg": "At least one coordinate cannot be snapped to the street. Try fewer points, a different route segment, or a different mode.",
+            "detail": data,
+        }
+
     return stt, data
 
-
 def isochrone(center_lat: float, center_lng: float, iso_type: str, iso_val: int, iso_mode: str) -> Tuple[int, Any]:
+    """
+    NextBillion Isochrone API expects Mapbox-style fields:
+      - coordinates="lat,lng"
+      - contours_minutes OR contours_meters
+    """
     params = {"key": NB_API_KEY}
-    body = {"center": {"lat": float(center_lat), "lng": float(center_lng)}, "type": iso_type, "value": int(iso_val), "mode": iso_mode}
-    ss.last_json["iso_payload"] = body
-    stt, data = nb_post("/isochrone/v2", params=params, body=body)
+
+    # IMPORTANT: coordinates is "lat,lng" (your logs show this is what works)
+    req: Dict[str, Any] = {
+        "coordinates": f"{float(center_lat):.6f},{float(center_lng):.6f}",
+        "mode": iso_mode,
+    }
+
+    if iso_type == "time":
+        # UI gives seconds; API wants minutes (your successful payload used contours_minutes=5)
+        req["contours_minutes"] = max(1, int(round(int(iso_val) / 60)))
+    else:
+        req["contours_meters"] = max(50, int(iso_val))
+
+    ss.last_json["iso_payload"] = {**params, **req}
+
+    # Isochrone is /isochrone/json (not /isochrone/v2 with center payload)
+    stt, data = nb_post("/isochrone/json", params=params, body=req)
     if stt == 404:
-        stt, data = nb_post("/isochrone", params=params, body=body)
+        stt, data = nb_post("/isochrone", params=params, body=req)
+
     ss.last_json["iso_response"] = data
     return stt, data
 
