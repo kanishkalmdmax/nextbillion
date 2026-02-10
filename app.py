@@ -1,12 +1,14 @@
 # app.py
 # NextBillion.ai — Visual API Tester (stable maps + 20+ stops + before/after optimize)
 # FIXES:
-# - VRP v2 payload shape (locations.location array) + validation (fixes recurring 400)  (docs show locations as an object w/ location array)
-# - Distance Matrix endpoint uses /distancematrix/json first (fixes 404s)
-# - Directions distance/time not stuck at 0 (robust parsing)
-# - VRP result polling (no-cache fetch button)
-# - Debug panel shows exact request/response (URL, params, JSON, raw text)
-# - Polyline decoding made crash-safe (no IndexError)
+# - Removes hard dependency on `polyline` (fixes ModuleNotFoundError)
+# - PolyLineTextPath import is optional (fixes folium.plugins crash)
+# - Replaces use_container_width=True with width="stretch" (Streamlit deprecation)
+# - Avoids pandas concat warning (safe append)
+# - Adds downloadable JSON logs for ALL actions (entire run) + last call + saved bundles
+#
+# References:
+# Streamlit deprecating use_container_width -> width="stretch" :contentReference[oaicite:1]{index=1}
 
 from __future__ import annotations
 
@@ -22,9 +24,14 @@ import pandas as pd
 import requests
 import streamlit as st
 import folium
-import polyline
-from folium.plugins import PolyLineTextPath
 from streamlit_folium import st_folium
+
+# Optional: folium arrow text along the polyline
+try:
+    from folium.plugins import PolyLineTextPath  # optional
+except Exception:
+    PolyLineTextPath = None
+
 
 # -----------------------------
 # CONFIG
@@ -35,17 +42,20 @@ NB_BASE = "https://api.nextbillion.io"
 st.set_page_config(page_title="NextBillion.ai — Visual API Tester", layout="wide")
 YESNO = ["No", "Yes"]
 
+
 # -----------------------------
 # HELPERS
 # -----------------------------
 def _now_unix() -> int:
     return int(time.time())
 
+
 def unix_to_human(ts: int) -> str:
     try:
         return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     except Exception:
         return str(ts)
+
 
 def normalize_latlng(lat: Any, lng: Any) -> Tuple[Optional[float], Optional[float]]:
     try:
@@ -59,12 +69,15 @@ def normalize_latlng(lat: Any, lng: Any) -> Tuple[Optional[float], Optional[floa
     except Exception:
         return None, None
 
+
 def latlng_str(lat: float, lng: float) -> str:
     return f"{lat:.6f},{lng:.6f}"
+
 
 def unique_key(prefix: str) -> str:
     st.session_state["_key_seq"] = st.session_state.get("_key_seq", 0) + 1
     return f"{prefix}_{st.session_state['_key_seq']}"
+
 
 def safe_json_loads(s: str) -> Optional[Any]:
     s = (s or "").strip()
@@ -75,6 +88,7 @@ def safe_json_loads(s: str) -> Optional[Any]:
     except Exception as e:
         st.error(f"Invalid JSON override: {e}")
         return None
+
 
 def deep_merge(a: Any, b: Any) -> Any:
     """Merge b into a (dicts only), returning new merged object."""
@@ -87,6 +101,15 @@ def deep_merge(a: Any, b: Any) -> Any:
                 out[k] = v
         return out
     return b
+
+
+def json_bytes(obj: Any) -> bytes:
+    return json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 # -----------------------------
 # STATE
@@ -110,10 +133,14 @@ def ensure_state():
     if "last_json" not in ss:
         ss.last_json = {}
     if "last_http" not in ss:
-        ss.last_http = {}  # last request/response debug
+        ss.last_http = {}
+    if "action_log" not in ss:
+        ss.action_log = []  # ALL API calls in this run
+
 
 ensure_state()
 ss = st.session_state
+
 
 def set_center(lat: float, lng: float, country: str | None = None):
     ss.center["lat"] = float(lat)
@@ -121,24 +148,37 @@ def set_center(lat: float, lng: float, country: str | None = None):
     if country:
         ss.center["country"] = country
 
+
+def _append_stop_row(df: pd.DataFrame, row: Dict[str, Any]) -> pd.DataFrame:
+    # avoids pandas concat FutureWarning by doing index-based assignment
+    next_i = len(df)
+    for col in ["label", "address", "lat", "lng", "source"]:
+        if col not in row:
+            row[col] = None
+    df.loc[next_i] = [row["label"], row["address"], row["lat"], row["lng"], row["source"]]
+    return df
+
+
 def add_stops(rows: List[Dict[str, Any]], source: str):
     df = ss.stops_df.copy()
     for r in rows:
-        label = r.get("label") or r.get("name") or f"Stop {len(df)+1}"
+        label = r.get("label") or r.get("name") or f"Stop {len(df) + 1}"
         addr = r.get("address") or r.get("name") or ""
         lat = r.get("lat")
         lng = r.get("lng")
         lat_f, lng_f = normalize_latlng(lat, lng)
         if lat_f is None:
             continue
-        df = pd.concat(
-            [df, pd.DataFrame([{"label": str(label), "address": str(addr), "lat": lat_f, "lng": lng_f, "source": source}])],
-            ignore_index=True,
+        df = _append_stop_row(
+            df,
+            {"label": str(label), "address": str(addr), "lat": lat_f, "lng": lng_f, "source": source},
         )
     ss.stops_df = df.reset_index(drop=True)
 
+
 def replace_stops(df_new: pd.DataFrame):
     ss.stops_df = df_new.reset_index(drop=True)
+
 
 def clear_stops():
     ss.stops_df = pd.DataFrame(columns=["label", "address", "lat", "lng", "source"])
@@ -147,14 +187,24 @@ def clear_stops():
     ss.vrp = {"create": None, "result": None, "order": None, "job_id": None}
     ss.last_json = {}
     ss.last_http = {}
+    ss.action_log = []
+
 
 # -----------------------------
-# HTTP (debuggable)
+# HTTP (debuggable + logged + downloadable)
 # -----------------------------
-def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None, timeout: int = 60, nocache: bool = False) -> Tuple[int, Any, str]:
+def _http(
+    method: str,
+    path: str,
+    params: Dict[str, Any] | None = None,
+    body: Dict[str, Any] | None = None,
+    timeout: int = 60,
+    nocache: bool = False,
+) -> Tuple[int, Any, str]:
     """
     Returns (status_code, parsed_json_or_text, raw_text)
     Stores request/response in ss.last_http for debugging.
+    Appends to ss.action_log for downloadable end-to-end logs.
     """
     url = NB_BASE + path
     params = params or {}
@@ -164,6 +214,8 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
     if nocache:
         params = dict(params)
         params["_ts"] = int(time.time() * 1000)
+
+    started = utc_now_iso()
 
     try:
         if method.upper() == "GET":
@@ -180,27 +232,49 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
             parsed = raw
 
         ss.last_http = {
+            "ts_utc": started,
             "method": method.upper(),
             "url": url,
+            "path": path,
             "params": params,
             "body": body,
             "status": r.status_code,
             "response_headers": dict(r.headers),
-            "raw_text": raw[:20000],  # prevent huge UI payloads
+            "raw_text": raw[:20000],
             "parsed": parsed,
         }
+
+        # Full run log entry (kept smaller than raw)
+        ss.action_log.append(
+            {
+                "ts_utc": started,
+                "method": method.upper(),
+                "url": url,
+                "path": path,
+                "params": params,
+                "body": body,
+                "status": r.status_code,
+                "parsed": parsed,
+            }
+        )
+
         return r.status_code, parsed, raw
+
     except Exception as e:
-        ss.last_http = {"error": str(e), "method": method.upper(), "url": url, "params": params, "body": body}
+        ss.last_http = {"ts_utc": started, "error": str(e), "method": method.upper(), "url": url, "path": path, "params": params, "body": body}
+        ss.action_log.append({"ts_utc": started, "error": str(e), "method": method.upper(), "url": url, "path": path, "params": params, "body": body})
         return 0, {"error": str(e)}, str(e)
+
 
 def nb_get(path: str, params: Dict[str, Any], *, nocache: bool = False) -> Tuple[int, Any]:
     stt, parsed, _ = _http("GET", path, params=params, body=None, nocache=nocache)
     return stt, parsed
 
+
 def nb_post(path: str, params: Dict[str, Any], body: Dict[str, Any], *, nocache: bool = False) -> Tuple[int, Any]:
     stt, parsed, _ = _http("POST", path, params=params, body=body, nocache=nocache)
     return stt, parsed
+
 
 # -----------------------------
 # PARSERS
@@ -252,7 +326,11 @@ def extract_geocode_candidates(resp: Any) -> List[Dict[str, Any]]:
 
     return out
 
+
 def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, float]]:
+    """
+    Local polyline decode (no external `polyline` dependency).
+    """
     if not isinstance(polyline_str, str):
         return []
     polyline_str = polyline_str.strip()
@@ -302,6 +380,7 @@ def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, 
 
     return coordinates
 
+
 def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
     if not isinstance(resp, dict):
         return []
@@ -335,7 +414,6 @@ def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
     if isinstance(poly, str) and poly.strip():
         pts5 = decode_polyline(poly, precision=5)
         pts6 = decode_polyline(poly, precision=6)
-        # choose whichever looks more plausible
         pts = pts6 if len(pts6) > len(pts5) else pts5
         if len(pts) >= 2:
             return pts
@@ -358,11 +436,8 @@ def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
 
     return []
 
+
 def parse_distance_duration_from_directions(resp: Any) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Returns (distance_m, duration_s) if present.
-    Handles numeric or nested formats.
-    """
     if not isinstance(resp, dict):
         return None, None
     routes = resp.get("routes") or []
@@ -379,7 +454,6 @@ def parse_distance_duration_from_directions(resp: Any) -> Tuple[Optional[float],
             if isinstance(v, (int, float)):
                 return float(v)
             if isinstance(v, dict):
-                # common shapes: {"value": 1234}
                 if "value" in v and isinstance(v["value"], (int, float, str)):
                     return float(v["value"])
             if isinstance(v, str) and v.strip():
@@ -391,13 +465,13 @@ def parse_distance_duration_from_directions(resp: Any) -> Tuple[Optional[float],
     dist = _num(r0.get("distance"))
     dur = _num(r0.get("duration"))
 
-    # some APIs: distanceMeters / durationSeconds
     if dist is None:
         dist = _num(r0.get("distanceMeters") or r0.get("distance_meters"))
     if dur is None:
         dur = _num(r0.get("durationSeconds") or r0.get("duration_seconds"))
 
     return dist, dur
+
 
 # -----------------------------
 # MAP RENDERING
@@ -441,12 +515,15 @@ def make_map(
 
     if route_pts and len(route_pts) >= 2:
         folium.PolyLine(route_pts, weight=5, opacity=0.8).add_to(m)
-        try:
-            pl = folium.PolyLine(route_pts, weight=0, opacity=0)
-            pl.add_to(m)
-            PolyLineTextPath(pl, "  ➤  ", repeat=True, offset=7, attributes={"font-size": "14", "fill": "black"}).add_to(m)
-        except Exception:
-            pass
+
+        # Optional arrows
+        if PolyLineTextPath is not None:
+            try:
+                pl = folium.PolyLine(route_pts, weight=0, opacity=0)
+                pl.add_to(m)
+                PolyLineTextPath(pl, "  ➤  ", repeat=True, offset=7, attributes={"font-size": "14", "fill": "black"}).add_to(m)
+            except Exception:
+                pass
 
         lats = [p[0] for p in route_pts]
         lngs = [p[1] for p in route_pts]
@@ -454,8 +531,10 @@ def make_map(
 
     return m
 
+
 def render_map(m: folium.Map, key: str) -> Dict[str, Any]:
     return st_folium(m, height=520, width="stretch", key=key)
+
 
 # -----------------------------
 # API BUILDERS
@@ -481,12 +560,14 @@ def build_global_route_params(ui: Dict[str, Any]) -> Dict[str, Any]:
         p["overview"] = ui["overview"]
     return p
 
+
 def geocode_forward(query: str, country: str, language: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY, "q": query, "country": country, "language": language}
     stt, data = nb_get("/geocode", params=params)
     if stt == 404:
         stt, data = nb_get("/geocode/v1", params=params)
     return stt, data
+
 
 def geocode_reverse(lat: float, lng: float, language: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY, "lat": lat, "lng": lng, "language": language}
@@ -495,10 +576,8 @@ def geocode_reverse(lat: float, lng: float, language: str) -> Tuple[int, Any]:
         stt, data = nb_get("/reverse/v1", params=params)
     return stt, data
 
+
 def distance_matrix(origins: List[str], destinations: List[str], params_extra: Dict[str, Any]) -> Tuple[int, Any]:
-    """
-    Prefer /distancematrix/json (documented) then fallback to /distancematrix/v2.
-    """
     params = dict(params_extra)
     params["origins"] = "|".join(origins)
     params["destinations"] = "|".join(destinations)
@@ -507,6 +586,7 @@ def distance_matrix(origins: List[str], destinations: List[str], params_extra: D
     if stt == 404:
         stt, data = nb_get("/distancematrix/v2", params=params)
     return stt, data
+
 
 def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any], override_params: Dict[str, Any] | None = None) -> Tuple[int, Any]:
     if len(order_latlng) < 2:
@@ -525,7 +605,6 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any],
     if override_params:
         params = deep_merge(params, override_params)
 
-    # Prefer /directions/json then fallback
     stt, data = nb_get("/directions/json", params=params)
     if stt == 404:
         stt, data = nb_get("/directions/v2", params=params)
@@ -533,34 +612,26 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any],
         stt, data = nb_get("/navigation/v2", params=params)
     return stt, data
 
+
 # -----------------------------
 # VRP v2 (FIXED PAYLOAD SHAPE)
 # -----------------------------
 def build_vrp_payload_v2(stops: pd.DataFrame, objective: str, routing_mode: str, traffic_ts: int) -> Dict[str, Any]:
-    """
-    Correct VRP v2 schema (fixes recurring 400):
-      locations is an OBJECT:
-        "locations": { "id": 0, "location": ["lat,lng", ...] }
-    NOT:
-        "locations": [ {id, location}, ... ]
-    """
     loc_list: List[str] = []
     for r in stops.reset_index(drop=True).itertuples():
         loc_list.append(latlng_str(float(r.lat), float(r.lng)))
 
     payload = {
-        "locations": {
-            "id": 0,
-            "location": loc_list
-        },
+        "locations": {"id": 0, "location": loc_list},
         "jobs": [{"id": int(i), "location_index": int(i)} for i in range(len(loc_list))],
         "vehicles": [{"id": "vehicle_1", "start_index": 0, "end_index": 0}],
         "options": {
             "objective": {"travel_cost": objective},
-            "routing": {"mode": routing_mode, "traffic_timestamp": int(traffic_ts)}
-        }
+            "routing": {"mode": routing_mode, "traffic_timestamp": int(traffic_ts)},
+        },
     }
     return payload
+
 
 def validate_vrp_payload_v2(body: Dict[str, Any]) -> Tuple[bool, str]:
     locs = body.get("locations")
@@ -571,6 +642,7 @@ def validate_vrp_payload_v2(body: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "VRP payload invalid: locations.location must be a non-empty array of 'lat,lng' strings."
     return True, "OK"
 
+
 def vrp_create_v2(body: Dict[str, Any]) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY}
     stt, data = nb_post("/optimization/v2", params=params, body=body)
@@ -578,18 +650,18 @@ def vrp_create_v2(body: Dict[str, Any]) -> Tuple[int, Any]:
     ss.last_json["vrp_create_response"] = data
     return stt, data
 
+
 def vrp_result_v2(job_id: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY, "id": job_id}
-    # IMPORTANT: result fetch must not be cached (job becomes ready later)
     stt, data = nb_get("/optimization/v2/result", params=params, nocache=True)
     ss.last_json["vrp_result_response"] = data
     return stt, data
+
 
 def parse_vrp_order(resp: Any) -> Optional[List[int]]:
     if not isinstance(resp, dict):
         return None
 
-    # common nesting: result.routes[0].steps / activities
     routes = resp.get("routes") or resp.get("result", {}).get("routes") or resp.get("solution", {}).get("routes")
     if isinstance(routes, dict):
         routes = [routes]
@@ -622,7 +694,6 @@ def parse_vrp_order(resp: Any) -> Optional[List[int]]:
             out.append(x)
         return out
 
-    # Sometimes order is in "sequence" or "jobs"
     seq = r0.get("sequence")
     if isinstance(seq, list) and seq:
         try:
@@ -632,15 +703,15 @@ def parse_vrp_order(resp: Any) -> Optional[List[int]]:
 
     return None
 
+
 # -----------------------------
-# SNAP + ISO (best-effort; debug-first)
+# SNAP + ISO
 # -----------------------------
 def snap_to_road(points: List[Tuple[float, float]]) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY}
     body = {"points": [{"lat": p[0], "lng": p[1]} for p in points]}
     ss.last_json["snap_payload"] = body
 
-    # try common endpoints
     stt, data = nb_post("/snapToRoad/v2", params=params, body=body)
     if stt == 404:
         stt, data = nb_post("/snaptoroad/v2", params=params, body=body)
@@ -650,14 +721,10 @@ def snap_to_road(points: List[Tuple[float, float]]) -> Tuple[int, Any]:
     ss.last_json["snap_response"] = data
     return stt, data
 
+
 def isochrone(center_lat: float, center_lng: float, iso_type: str, iso_val: int, iso_mode: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY}
-    body = {
-        "center": {"lat": float(center_lat), "lng": float(center_lng)},
-        "type": iso_type,
-        "value": int(iso_val),
-        "mode": iso_mode,
-    }
+    body = {"center": {"lat": float(center_lat), "lng": float(center_lng)}, "type": iso_type, "value": int(iso_val), "mode": iso_mode}
     ss.last_json["iso_payload"] = body
     stt, data = nb_post("/isochrone/v2", params=params, body=body)
     if stt == 404:
@@ -665,11 +732,32 @@ def isochrone(center_lat: float, center_lng: float, iso_type: str, iso_val: int,
     ss.last_json["iso_response"] = data
     return stt, data
 
+
 # -----------------------------
 # UI
 # -----------------------------
 st.title("NextBillion.ai — Visual API Tester")
 st.caption(f"Stops loaded: {len(ss.stops_df)}")
+
+with st.expander("⬇️ Downloads (Run Logs)", expanded=False):
+    st.download_button(
+        "Download FULL Run Log (all API calls)",
+        data=json_bytes(ss.action_log),
+        file_name=f"nextbillion_run_log_{int(time.time())}.json",
+        mime="application/json",
+    )
+    st.download_button(
+        "Download LAST API Call (request+response)",
+        data=json_bytes(ss.last_http or {}),
+        file_name=f"nextbillion_last_call_{int(time.time())}.json",
+        mime="application/json",
+    )
+    st.download_button(
+        "Download Saved JSON Bundle (ss.last_json)",
+        data=json_bytes(ss.last_json or {}),
+        file_name=f"nextbillion_saved_bundle_{int(time.time())}.json",
+        mime="application/json",
+    )
 
 with st.expander("Global route options (Directions / Matrix / Optimize)", expanded=False):
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
@@ -721,14 +809,17 @@ with st.sidebar:
             lines = [x.strip() for x in (paste or "").splitlines() if x.strip()]
             if input_mode.startswith("Addresses"):
                 df = ss.stops_df.copy()
-                for i, addr in enumerate(lines):
-                    df = pd.concat([df, pd.DataFrame([{
-                        "label": f"Stop {len(df)+1}",
-                        "address": addr,
-                        "lat": None,
-                        "lng": None,
-                        "source": "Pasted address",
-                    }])], ignore_index=True)
+                for addr in lines:
+                    df = _append_stop_row(
+                        df,
+                        {
+                            "label": f"Stop {len(df)+1}",
+                            "address": addr,
+                            "lat": None,
+                            "lng": None,
+                            "source": "Pasted address",
+                        },
+                    )
                 ss.stops_df = df.reset_index(drop=True)
             else:
                 rows = []
@@ -762,7 +853,7 @@ with tabs[0]:
 
     df = ss.stops_df.copy()
 
-    if st.button("🧭 Geocode all missing coordinates", key="geo_geocode_btn", use_container_width=True):
+    if st.button("🧭 Geocode all missing coordinates", key="geo_geocode_btn", width="stretch"):
         missing = df[df["lat"].isna() | df["lng"].isna()].copy()
         last_resp = None
         for idx, row in missing.iterrows():
@@ -784,7 +875,7 @@ with tabs[0]:
         ss.last_json["geocode_response_sample"] = last_resp
         ss.mapsig["geocode"] += 1
 
-    st.dataframe(ss.stops_df, use_container_width=True, height=220)
+    st.dataframe(ss.stops_df, width="stretch", height=220)
 
     m = make_map(center=(float(ss.center["lat"]), float(ss.center["lng"])), stops=ss.stops_df, clicked=ss.clicked_pin)
     map_ret = render_map(m, key=f"map_geocode_{ss.mapsig['geocode']}")
@@ -857,7 +948,7 @@ with tabs[1]:
             pts.append((center_lat + dlat, center_lng + dlng))
         return pts
 
-    if st.button("🎲 Generate random stops around center", key="pl_gen_random", use_container_width=True):
+    if st.button("🎲 Generate random stops around center", key="pl_gen_random", width="stretch"):
         pts = gen_random_points(float(ss.center["lat"]), float(ss.center["lng"]), int(n_rand), int(radius_m), int(seed))
         rows = [{"label": f"Rand {i}", "address": "", "lat": la, "lng": ln} for i, (la, ln) in enumerate(pts, start=1)]
         add_stops(rows, "Random around center")
@@ -893,7 +984,7 @@ with tabs[2]:
             st.markdown("### Step 1 — Directions (Before)")
             dir_override_text = st.text_area("Optional: Directions query override (JSON). Leave {} for none.", value="{}", height=90, key="dir_before_override")
 
-            if st.button("🧭 Compute route (Before)", key="rt_before_btn", use_container_width=True):
+            if st.button("🧭 Compute route (Before)", key="rt_before_btn", width="stretch"):
                 override = safe_json_loads(dir_override_text)
                 if override is None:
                     st.stop()
@@ -907,7 +998,6 @@ with tabs[2]:
                 ss.route_before["duration_s"] = dur_s
 
                 if dist_m is None or dur_s is None:
-                    # fallback via matrix sum
                     stt_m, data_m = distance_matrix(stops_ll[:-1], stops_ll[1:], params_extra=GLOBAL_PARAMS)
                     ss.last_json["matrix_pairs_before"] = data_m
                     dist_total = 0.0
@@ -957,7 +1047,7 @@ with tabs[2]:
             routing_mode = st.selectbox("VRP routing.mode", ["car", "truck", "bike", "walk"], index=0, key="vrp_routing_mode")
             traffic_ts = st.number_input("VRP routing.traffic_timestamp (unix)", min_value=0, value=_now_unix(), step=60, key="vrp_traffic_ts")
 
-            if st.button("⚙️ Run optimization (VRP v2)", key="vrp_run_btn", use_container_width=True):
+            if st.button("⚙️ Run optimization (VRP v2)", key="vrp_run_btn", width="stretch"):
                 override = safe_json_loads(vrp_override_text)
                 if override is None:
                     st.stop()
@@ -982,7 +1072,7 @@ with tabs[2]:
                     ss.vrp["job_id"] = job_id
                     st.success(f"Optimization job created: {job_id}")
 
-            if st.button("🔄 Fetch VRP result again", key="vrp_fetch_btn", use_container_width=True):
+            if st.button("🔄 Fetch VRP result again", key="vrp_fetch_btn", width="stretch"):
                 job_id = ss.vrp.get("job_id")
                 if not job_id:
                     st.warning("No job id yet. Run optimization first.")
@@ -1017,7 +1107,7 @@ with tabs[2]:
                 if df_after is None:
                     df_after = ss.stops_df.copy()
 
-            if st.button("🧭 Compute route (After)", key="rt_after_btn", use_container_width=True):
+            if st.button("🧭 Compute route (After)", key="rt_after_btn", width="stretch"):
                 override = safe_json_loads(dir_after_override_text)
                 if override is None:
                     st.stop()
@@ -1104,7 +1194,7 @@ with tabs[3]:
 
         ll = [latlng_str(float(r.lat), float(r.lng)) for r in df_use.itertuples()]
 
-        if st.button("📐 Compute Distance Matrix (NxN)", key="mx_btn", use_container_width=True):
+        if st.button("📐 Compute Distance Matrix (NxN)", key="mx_btn", width="stretch"):
             stt, data = distance_matrix(ll, ll, params_extra=GLOBAL_PARAMS)
             ss.last_json["matrix_nxn"] = data
             ss.mapsig["matrix"] += 1
@@ -1128,9 +1218,9 @@ with tabs[3]:
                 dur_min.append([((e.get("duration") or {}).get("value") or 0) / 60 for e in elems])
 
             st.markdown("### Distance (km)")
-            st.dataframe(pd.DataFrame(dist_km).round(2), use_container_width=True, height=240)
+            st.dataframe(pd.DataFrame(dist_km).round(2), width="stretch", height=240)
             st.markdown("### Duration (min)")
-            st.dataframe(pd.DataFrame(dur_min).round(1), use_container_width=True, height=240)
+            st.dataframe(pd.DataFrame(dur_min).round(1), width="stretch", height=240)
 
 # -----------------------------
 # TAB 5: SNAP + ISO
@@ -1153,7 +1243,7 @@ with tabs[4]:
         else:
             n_path = st.slider("N geometry points to send (first N)", min_value=2, max_value=max_pts, value=min(200, max_pts), step=1, key="snap_n")
 
-        if st.button("🧷 Snap to Road", key="snap_btn", use_container_width=True):
+        if st.button("🧷 Snap to Road", key="snap_btn", width="stretch"):
             pts = coords[: int(n_path)] if coords else []
             if len(pts) < 2:
                 st.warning("Need route geometry (2+ points). Compute directions first.")
@@ -1176,7 +1266,7 @@ with tabs[4]:
         iso_mode = st.selectbox("Mode", ["car", "truck", "bike", "walk"], index=0, key="iso_mode")
         iso_val = st.number_input("Value (seconds if time, meters if distance)", min_value=60, max_value=2000000, value=1800, step=60, key="iso_val")
 
-        if st.button("🟦 Compute Isochrone", key="iso_btn", use_container_width=True):
+        if st.button("🟦 Compute Isochrone", key="iso_btn", width="stretch"):
             stt, data = isochrone(float(ss.center["lat"]), float(ss.center["lng"]), iso_type, int(iso_val), iso_mode)
             ss.mapsig["iso"] += 1
             if stt != 200:
@@ -1199,327 +1289,30 @@ with tabs[5]:
     else:
         st.json(ss.last_http)
 
+    st.download_button(
+        "Download LAST API Call JSON",
+        data=json_bytes(ss.last_http or {}),
+        file_name=f"nextbillion_last_call_{int(time.time())}.json",
+        mime="application/json",
+    )
+
     st.markdown("### Saved JSON bundles")
     st.json(ss.last_json)
 
-import json
-import time
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
-
-import requests
-import streamlit as st
-import polyline  # pip install polyline
-
-
-NB_BASE = "https://api.nextbillion.io"
-
-
-# -----------------------------
-# Session State Helpers
-# -----------------------------
-def init_state():
-    st.session_state.setdefault("run_logs", [])
-    st.session_state.setdefault("last_vrp_job_id", None)
-    st.session_state.setdefault("last_vrp_result", None)
-    st.session_state.setdefault("last_route_latlng", None)  # list[(lat,lng)]
-    st.session_state.setdefault("api_key", "")
-
-
-def add_log(entry: Dict[str, Any]) -> None:
-    st.session_state.run_logs.append(entry)
-
-
-def download_logs_button():
-    payload = {
-        "exported_at": datetime.utcnow().isoformat() + "Z",
-        "logs": st.session_state.run_logs,
-    }
     st.download_button(
-        "Download ALL Run Logs (JSON)",
-        data=json.dumps(payload, indent=2),
-        file_name=f"nextbillion_run_logs_{int(time.time())}.json",
+        "Download Saved Bundle (ss.last_json)",
+        data=json_bytes(ss.last_json or {}),
+        file_name=f"nextbillion_saved_bundle_{int(time.time())}.json",
         mime="application/json",
-        use_container_width=True,
     )
 
+    st.markdown("### Full run log (all API actions)")
+    st.caption(f"Logged API actions: {len(ss.action_log)}")
+    st.json(ss.action_log[-10:] if ss.action_log else [])  # show last 10 only
 
-# -----------------------------
-# Request Wrapper (logs everything)
-# -----------------------------
-def nb_request(
-    method: str,
-    path: str,
-    *,
-    key: str,
-    params: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Dict[str, Any]] = None,
-    timeout: int = 60,
-) -> Dict[str, Any]:
-    if not params:
-        params = {}
-    params = dict(params)
-    params["key"] = key  # NextBillion uses key= in query string
-
-    url = f"{NB_BASE}{path}"
-    started = time.time()
-
-    try:
-        resp = requests.request(
-            method=method.upper(),
-            url=url,
-            params=params,
-            json=json_body,
-            timeout=timeout,
-        )
-        elapsed_ms = int((time.time() - started) * 1000)
-
-        # Try JSON, fallback to text
-        try:
-            parsed = resp.json()
-        except Exception:
-            parsed = None
-
-        log_entry = {
-            "ts_utc": datetime.utcnow().isoformat() + "Z",
-            "method": method.upper(),
-            "url": url,
-            "params": params,
-            "body": json_body,
-            "status": resp.status_code,
-            "elapsed_ms": elapsed_ms,
-            "response_headers": dict(resp.headers),
-            "parsed": parsed,
-            "raw_text": resp.text if parsed is None else None,
-        }
-        add_log(log_entry)
-
-        # Return consistent structure
-        return {
-            "ok": resp.ok,
-            "status": resp.status_code,
-            "data": parsed if parsed is not None else resp.text,
-        }
-
-    except Exception as e:
-        elapsed_ms = int((time.time() - started) * 1000)
-        add_log(
-            {
-                "ts_utc": datetime.utcnow().isoformat() + "Z",
-                "method": method.upper(),
-                "url": url,
-                "params": params,
-                "body": json_body,
-                "status": None,
-                "elapsed_ms": elapsed_ms,
-                "error": str(e),
-            }
-        )
-        return {"ok": False, "status": None, "data": {"error": str(e)}}
-
-
-# -----------------------------
-# Geometry Helpers
-# -----------------------------
-def decode_route_polyline_to_latlng(encoded: str) -> List[Tuple[float, float]]:
-    """
-    NextBillion returns encoded polyline. polyline.decode gives [(lat, lng), ...].
-    This format is what Folium/Leaflet expects for PolyLine.
-    """
-    if not encoded:
-        return []
-    return polyline.decode(encoded)
-
-
-# -----------------------------
-# API Calls (Correct Endpoints)
-# -----------------------------
-def get_isochrone(
-    key: str,
-    lat: float,
-    lng: float,
-    minutes: int = 30,
-    mode: str = "car",
-    polygons: bool = True,
-) -> Dict[str, Any]:
-    # Isochrone is GET /isochrone/json with coordinates=lat,lng (per docs) :contentReference[oaicite:3]{index=3}
-    params = {
-        "coordinates": f"{lat},{lng}",
-        "contours_minutes": str(minutes),
-        "polygons": "true" if polygons else "false",
-        "mode": mode,
-    }
-    return nb_request("GET", "/isochrone/json", key=key, params=params)
-
-
-def snap_to_roads(
-    key: str,
-    points_latlng: List[Tuple[float, float]],
-) -> Dict[str, Any]:
-    # Snap is POST /snapToRoads/json :contentReference[oaicite:4]{index=4}
-    body = {
-        "points": [{"lat": lat, "lng": lng} for lat, lng in points_latlng]
-    }
-    return nb_request("POST", "/snapToRoads/json", key=key, json_body=body)
-
-
-def create_vrp_job(key: str, vrp_payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Create job: POST /optimization/v2?key=... :contentReference[oaicite:5]{index=5}
-    return nb_request("POST", "/optimization/v2", key=key, json_body=vrp_payload)
-
-
-def fetch_vrp_result(key: str, job_id: str) -> Dict[str, Any]:
-    # Fetch result: GET /optimization/v2/result?id=...&key=... :contentReference[oaicite:6]{index=6}
-    return nb_request("GET", "/optimization/v2/result", key=key, params={"id": job_id})
-
-
-def poll_vrp_result(
-    key: str,
-    job_id: str,
-    *,
-    max_attempts: int = 10,
-    sleep_s: float = 1.0,
-) -> Dict[str, Any]:
-    """
-    Handles the "Job created, but result not ready yet" situation.
-    We retry a few times, logging every attempt.
-    """
-    last = None
-    for attempt in range(1, max_attempts + 1):
-        last = fetch_vrp_result(key, job_id)
-        if last.get("ok") and isinstance(last.get("data"), dict):
-            # Heuristic: if result exists, we're done
-            if "result" in last["data"] and last["data"]["result"]:
-                return last
-        time.sleep(sleep_s)
-    return last or {"ok": False, "status": None, "data": {"error": "No response"}}
-
-
-# -----------------------------
-# UI: Run Logs Panel
-# -----------------------------
-def render_logs_panel():
-    st.subheader("Run Logs (for debugging)")
-    st.caption("Every API action is captured here. Download and paste the JSON to share a full run.")
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        download_logs_button()
-    with col2:
-        if st.button("Clear logs", use_container_width=True):
-            st.session_state.run_logs = []
-            st.rerun()
-
-    with st.expander(f"View latest logs ({len(st.session_state.run_logs)})", expanded=False):
-        st.json(st.session_state.run_logs[-5:] if st.session_state.run_logs else [])
-
-
-# -----------------------------
-# Example: Route Optimization Screen (minimal + correct)
-# -----------------------------
-def route_optimization_screen():
-    st.header("Route Optimization (VRP)")
-
-    key = st.session_state.api_key.strip()
-    if not key:
-        st.warning("Add your NextBillion API key in the sidebar.")
-        return
-
-    st.write("Paste your VRP payload (JSON) below, then create + fetch results.")
-
-    vrp_text = st.text_area(
-        "VRP Payload JSON",
-        height=250,
-        value=json.dumps(
-            {
-                "locations": {"id": 0, "location": ["-35.616515,-65.299796"]},
-                "jobs": [{"id": 0, "location_index": 0}],
-                "vehicles": [{"id": "vehicle_1", "start_index": 0, "end_index": 0}],
-            },
-            indent=2,
-        ),
+    st.download_button(
+        "Download FULL Run Log (all API calls)",
+        data=json_bytes(ss.action_log),
+        file_name=f"nextbillion_run_log_{int(time.time())}.json",
+        mime="application/json",
     )
-
-    colA, colB, colC = st.columns([1, 1, 1])
-
-    with colA:
-        if st.button("Create VRP Job", use_container_width=True):
-            try:
-                payload = json.loads(vrp_text)
-            except Exception as e:
-                st.error(f"Invalid JSON: {e}")
-                return
-
-            resp = create_vrp_job(key, payload)
-            st.json(resp["data"])
-
-            if resp["ok"] and isinstance(resp["data"], dict) and resp["data"].get("id"):
-                st.session_state.last_vrp_job_id = resp["data"]["id"]
-                st.success(f"Job created: {st.session_state.last_vrp_job_id}")
-
-    with colB:
-        if st.button("Fetch VRP Result (once)", use_container_width=True):
-            job_id = st.session_state.last_vrp_job_id
-            if not job_id:
-                st.warning("No job_id yet. Create a job first.")
-            else:
-                res = fetch_vrp_result(key, job_id)
-                st.session_state.last_vrp_result = res["data"]
-                st.json(res["data"])
-
-    with colC:
-        if st.button("Fetch VRP Result (retry)", use_container_width=True):
-            job_id = st.session_state.last_vrp_job_id
-            if not job_id:
-                st.warning("No job_id yet. Create a job first.")
-            else:
-                res = poll_vrp_result(key, job_id, max_attempts=12, sleep_s=1.0)
-                st.session_state.last_vrp_result = res["data"]
-                st.json(res["data"])
-
-    st.divider()
-
-    st.subheader("Route Geometry (fixes the ‘straight line’ issue)")
-    st.caption("We decode the route geometry polyline from optimization result and store lat/lng pairs.")
-
-    if st.session_state.last_vrp_result and isinstance(st.session_state.last_vrp_result, dict):
-        data = st.session_state.last_vrp_result
-        try:
-            routes = data["result"]["routes"]
-            if routes and "geometry" in routes[0]:
-                encoded = routes[0]["geometry"]
-                latlng = decode_route_polyline_to_latlng(encoded)
-                st.session_state.last_route_latlng = latlng
-                st.success(f"Decoded {len(latlng)} points (lat,lng). This is what you should plot on the map.")
-                st.write(latlng[:5], " ...")
-            else:
-                st.info("No geometry found in result yet.")
-        except Exception as e:
-            st.error(f"Could not read geometry: {e}")
-
-    st.divider()
-    render_logs_panel()
-
-
-# -----------------------------
-# Sidebar + App Router
-# -----------------------------
-def main():
-    st.set_page_config(page_title="NextBillion Debuggable Console", layout="wide")
-    init_state()
-
-    with st.sidebar:
-        st.title("Settings")
-        st.session_state.api_key = st.text_input("NextBillion API Key", value=st.session_state.api_key, type="password")
-
-        st.caption("Tip: After any run, download the full logs JSON and share it.")
-
-        if st.session_state.last_vrp_job_id:
-            st.info(f"Last VRP job_id:\n{st.session_state.last_vrp_job_id}")
-
-    route_optimization_screen()
-
-
-if __name__ == "__main__":
-    main()
-
