@@ -73,21 +73,32 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 def choose_latlng(lat: Any, lng: Any, ref: Tuple[float, float] | None = None) -> Tuple[Optional[float], Optional[float], bool]:
-    lat_f, lng_f, _sw = choose_latlng(lat, lng, ref=(float(ss.center['lat']), float(ss.center['lng'])) if 'center' in ss else None)
-    lat_s, lng_s = normalize_latlng(lng, lat)
-    if lat_f is None and lat_s is None:
+    """Return (lat, lng, swapped) choosing between (lat,lng) and (lng,lat).
+
+    Many APIs return coordinates as [lng, lat]. This helper picks the more plausible
+    pair using bounds checks and (optionally) proximity to a reference point.
+    """
+    lat1, lng1 = normalize_latlng(lat, lng)
+    lat2, lng2 = normalize_latlng(lng, lat)
+
+    v1 = lat1 is not None and lng1 is not None
+    v2 = lat2 is not None and lng2 is not None
+
+    if not v1 and not v2:
         return None, None, False
-    if lat_f is not None and lat_s is None:
-        return lat_f, lng_f, False
-    if lat_f is None and lat_s is not None:
-        return lat_s, lng_s, True
+    if v1 and not v2:
+        return lat1, lng1, False
+    if not v1 and v2:
+        return lat2, lng2, True
+
     if ref is not None:
         rlat, rlng = float(ref[0]), float(ref[1])
-        d1 = haversine_km(lat_f, lng_f, rlat, rlng)
-        d2 = haversine_km(lat_s, lng_s, rlat, rlng)
+        d1 = haversine_km(lat1, lng1, rlat, rlng)
+        d2 = haversine_km(lat2, lng2, rlat, rlng)
         if d2 + 1e-6 < d1:
-            return lat_s, lng_s, True
-    return lat_f, lng_f, False
+            return lat2, lng2, True
+
+    return lat1, lng1, False
 
 def sanitize_stops_df(df: pd.DataFrame, ref: Tuple[float, float] | None = None) -> Tuple[pd.DataFrame, int]:
     if df is None or df.empty:
@@ -951,21 +962,38 @@ with tabs[1]:
         add_stops(rows, "Random around center")
 
         # Resolve addresses (reverse geocode) — FIXED indentation + dtype safety
-        if resolve_addr == "Yes":
+                if resolve_addr == "Yes":
             df = ss.stops_df.copy()
+            if "address" not in df.columns:
+                df["address"] = ""
             df["address"] = df["address"].astype("string")
-            for idx, row in df[df["source"].str.contains("Random around center", na=False)].iterrows():
+
+            # Resolve addresses for ALL stops that have valid lat/lng
+            ref = (float(ss.center["lat"]), float(ss.center["lng"]))
+            for ridx, row in df.iterrows():
+                lat_c, lng_c, _sw = choose_latlng(row.get("lat"), row.get("lng"), ref=ref)
+                if lat_c is None or lng_c is None:
+                    continue
+
+                # Only overwrite if empty / missing
+                addr = str(row.get("address") or "").strip()
+                if addr != "" and addr.lower() != "nan":
+                    continue
+
                 try:
-                    status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
+                    status, rresp = geocode_reverse(float(lat_c), float(lng_c), language=language)
                     cand = extract_geocode_candidates(rresp)
                     if cand:
-                        df.loc[idx, "address"] = str(cand[0]["name"])
-                        df.loc[idx, "source"] = f"Reverse-geocode ({status})"
+                        df.loc[ridx, "lat"] = lat_c
+                        df.loc[ridx, "lng"] = lng_c
+                        df.loc[ridx, "address"] = str(cand[0]["name"])
+                        df.loc[ridx, "source"] = f"Reverse-geocode ({status})"
                 except Exception:
                     continue
+
             replace_stops(df)
 
-        ss.mapsig["places"] += 1
+ss.mapsig["places"] += 1
 
     st.markdown("### Stops table")
     st.dataframe(ss.stops_df, width="stretch", height=260)
