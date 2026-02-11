@@ -109,6 +109,7 @@ def ensure_state():
         ss.vrp = {"create": None, "result": None, "order": None, "job_id": None}
     if "last_json" not in ss:
         ss.last_json = {}
+    ss.api_logs = []  # list of {ts, method, endpoint, params, body, status, response}
     if "last_http" not in ss:
         ss.last_http = {}  # last request/response debug
     if "_region_candidates" not in ss:
@@ -235,6 +236,26 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
         ss.last_http = {"error": str(e), "method": method.upper(), "url": url, "params": params, "body": body}
         return 0, {"error": str(e)}, str(e)
 
+
+def log_api_call(method: str, endpoint: str, params: Optional[Dict[str, Any]], body: Optional[Dict[str, Any]], status: int, response: Any) -> None:
+    """Collects a lightweight audit trail for debugging and easy sharing."""
+    try:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "method": method,
+            "endpoint": endpoint,
+            "params": params or {},
+            "body": body or {},
+            "status": status,
+            "response": response,
+        }
+        # Keep logs bounded to avoid ballooning session size
+        ss.api_logs.append(entry)
+        if len(ss.api_logs) > 200:
+            ss.api_logs = ss.api_logs[-200:]
+    except Exception:
+        pass
+
 def nb_get(path: str, params: Dict[str, Any], *, nocache: bool = False) -> Tuple[int, Any]:
     stt, parsed, _ = _http("GET", path, params=params, body=None, nocache=nocache)
     return stt, parsed
@@ -343,56 +364,94 @@ def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, 
 
     return coordinates
 
-def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
-    if not isinstance(resp, dict):
+
+def choose_latlng_from_pair(pair: List[float], ref: Optional[Tuple[float, float]] = None) -> Optional[Tuple[float, float]]:
+    """Accepts [a,b] where order may be [lat,lng] or [lng,lat]. Uses ref to decide."""
+    if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+        return None
+    a, b = pair[0], pair[1]
+    try:
+        a = float(a); b = float(b)
+    except Exception:
+        return None
+
+    cand1 = normalize_latlng(a, b)  # assume lat,lng
+    cand2 = normalize_latlng(b, a)  # assume lng,lat
+    if cand1 is None and cand2 is None:
+        return None
+    if cand1 is not None and cand2 is None:
+        return cand1
+    if cand2 is not None and cand1 is None:
+        return cand2
+
+    # both valid – use reference point to decide (pick the closer one)
+    if ref is None:
+        return cand1
+    rlat, rlng = ref
+    d1 = (cand1[0] - rlat) ** 2 + (cand1[1] - rlng) ** 2
+    d2 = (cand2[0] - rlat) ** 2 + (cand2[1] - rlng) ** 2
+    return cand1 if d1 <= d2 else cand2
+
+
+def extract_route_geometry(route_json: Any, ref: Optional[Tuple[float, float]] = None) -> List[Tuple[float, float]]:
+    """Extracts a list of (lat,lng) points from NextBillion directions response."""
+    if not isinstance(route_json, dict):
         return []
-
-    # GeoJSON FeatureCollection
-    if resp.get("type") == "FeatureCollection" and "features" in resp:
-        for f in resp["features"]:
-            geom = (f or {}).get("geometry") or {}
-            if geom.get("type") == "LineString":
-                coords = geom.get("coordinates") or []
-                pts = []
-                for c in coords:
-                    if isinstance(c, list) and len(c) >= 2:
-                        lng, lat = c[0], c[1]
-                        lat_f, lng_f = normalize_latlng(lat, lng)
-                        if lat_f is not None:
-                            pts.append((lat_f, lng_f))
-                if pts:
-                    return pts
-
-    routes = resp.get("routes") or []
-    if isinstance(routes, dict):
-        routes = [routes]
-    if not routes:
+    routes = route_json.get("routes") or route_json.get("data", {}).get("routes")
+    if not isinstance(routes, list) or not routes:
         return []
-
     r0 = routes[0] if isinstance(routes[0], dict) else {}
-    poly = r0.get("geometry") or r0.get("polyline") or (r0.get("overview_polyline") or {}).get("points")
+    geom = r0.get("geometry") or r0.get("polyline") or r0.get("points")
 
-    if isinstance(poly, str) and poly.strip():
-        pts5 = decode_polyline(poly, precision=5)
-        pts6 = decode_polyline(poly, precision=6)
-        pts = pts6 if len(pts6) > len(pts5) else pts5
-        if len(pts) >= 2:
-            return pts
+    # geometry can be:
+    # - encoded polyline string
+    # - list of [lng,lat] pairs (GeoJSON-like)
+    # - dict with 'coordinates'
+    if isinstance(geom, str) and geom.strip():
+        pts5 = decode_polyline(geom, precision=5)
+        pts6 = decode_polyline(geom, precision=6)
+        # choose the one that is closer to ref (or the one that yields sane coordinates)
+        if ref is None:
+            return pts5 if pts5 else pts6
+        def score(pts: List[Tuple[float, float]]) -> float:
+            if not pts:
+                return 1e18
+            rlat, rlng = ref
+            plat, plng = pts[0]
+            return (plat - rlat) ** 2 + (plng - rlng) ** 2
+        return pts5 if score(pts5) <= score(pts6) else pts6
 
-    geom = r0.get("geometry")
+    if isinstance(geom, dict):
+        coords = geom.get("coordinates")
+        if isinstance(coords, list):
+            out: List[Tuple[float, float]] = []
+            for p in coords:
+                if isinstance(p, (list, tuple)) and len(p) >= 2:
+                    ll = choose_latlng_from_pair(list(p), ref=ref)
+                    if ll:
+                        out.append(ll)
+            return out
+
     if isinstance(geom, list):
-        pts = []
+        out: List[Tuple[float, float]] = []
         for p in geom:
-            if isinstance(p, dict):
-                lat_f, lng_f = normalize_latlng(p.get("lat"), p.get("lng"))
-                if lat_f is not None:
-                    pts.append((lat_f, lng_f))
-            elif isinstance(p, list) and len(p) >= 2:
-                lat_f, lng_f = normalize_latlng(p[0], p[1])
-                if lat_f is not None:
-                    pts.append((lat_f, lng_f))
-        if len(pts) >= 2:
-            return pts
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                ll = choose_latlng_from_pair(list(p), ref=ref)
+                if ll:
+                    out.append(ll)
+        return out
+
+    # fallback: scan legs/steps
+    legs = r0.get("legs")
+    if isinstance(legs, list):
+        pts: List[Tuple[float, float]] = []
+        for leg in legs:
+            steps = leg.get("steps") if isinstance(leg, dict) else None
+            if isinstance(steps, list):
+                for stp in steps:
+                    if isinstance(stp, dict) and isinstance(stp.get("geometry"), str):
+                        pts.extend(decode_polyline(stp["geometry"], precision=5))
+        return pts
 
     return []
 
@@ -520,18 +579,30 @@ def build_global_route_params(ui: Dict[str, Any]) -> Dict[str, Any]:
         p["overview"] = ui["overview"]
     return p
 
-def geocode_forward(query: str, country: str, language: str) -> Tuple[int, Any]:
-    params = {"key": NB_API_KEY, "q": query, "country": country, "language": language}
+
+def geocode_forward(query: str, at_lat: float, at_lng: float, country_code: str = "") -> Tuple[int, Any]:
+    """Forward geocode using Places Forward API: GET /geocode?q=...&at=lat,lng&in=countryCode:XX"""
+    params: Dict[str, Any] = {
+        "key": NB_API_KEY,
+        "q": query,
+        "at": latlng_str(at_lat, at_lng),
+    }
+    if country_code.strip():
+        params["in"] = f"countryCode:{country_code.strip().upper()}"
+
+    ss.last_json["geocode_forward_params"] = params
     stt, data = nb_get("/geocode", params=params)
-    if stt == 404:
-        stt, data = nb_get("/geocode/v1", params=params)
+    ss.last_json["geocode_forward_response"] = data
     return stt, data
 
-def geocode_reverse(lat: float, lng: float, language: str) -> Tuple[int, Any]:
-    params = {"key": NB_API_KEY, "lat": lat, "lng": lng, "language": language}
-    stt, data = nb_get("/reverse", params=params)
-    if stt == 404:
-        stt, data = nb_get("/reverse/v1", params=params)
+
+def geocode_reverse(lat: float, lng: float) -> Tuple[int, Any]:
+    """Reverse geocode using Places Reverse API: GET /revgeocode?at=lat,lng"""
+    params = {"key": NB_API_KEY, "at": latlng_str(lat, lng)}
+    ss.last_json["geocode_reverse_params"] = params
+
+    stt, data = nb_get("/revgeocode", params=params)
+    ss.last_json["geocode_reverse_response"] = data
     return stt, data
 
 def distance_matrix(origins: List[str], destinations: List[str], params_extra: Dict[str, Any]) -> Tuple[int, Any]:
@@ -805,7 +876,7 @@ with tabs[0]:
             addr = str(row.get("address") or "").strip()
             if not addr:
                 continue
-            status, resp = geocode_forward(addr, country=ss.center["country"], language=language)
+            status, resp = geocode_forward(addr, float(ss.center["lat"]), float(ss.center["lng"]), country_code=ss.center["country"])
             last_resp = resp
             candidates = extract_geocode_candidates(resp)
             if candidates:
@@ -845,7 +916,7 @@ with tabs[1]:
         pl_country = st.text_input("Country filter (3-letter)", value=ss.center["country"], key="pl_country")
 
     if st.button("Search Region", key="pl_search_region"):
-        status, resp = geocode_forward(region_q, country=pl_country.strip().upper()[:3], language=language)
+        status, resp = geocode_forward(region_q, float(ss.center["lat"]), float(ss.center["lng"]), country_code=pl_country.strip().upper()[:3])
         ss.last_json["region_search_response"] = resp
         ss._region_candidates = extract_geocode_candidates(resp)
 
@@ -905,7 +976,7 @@ with tabs[1]:
             df["address"] = df["address"].astype("string")
             for idx, row in df[df["source"].str.contains("Random around center", na=False)].iterrows():
                 try:
-                    status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
+                    status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]))
                     cand = extract_geocode_candidates(rresp)
                     if cand:
                         df.loc[idx, "address"] = str(cand[0]["name"])
