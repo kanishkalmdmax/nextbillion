@@ -842,7 +842,7 @@ with st.sidebar:
 
     st.caption("Tip: Geocode once → reuse across all tabs (saves API calls).")
 
-tabs = st.tabs(["Geocode & Map", "Places (Search + Generate Stops)", "Route + Optimize (Before vs After)", "Distance Matrix (NxN)", "Snap-to-Road + Isochrone", "Debug (Last API Call)"])
+aaatabs = st.tabs(["Geocode & Map", "Places (Search + Generate Stops)", "Route + Optimize (Before vs After)", "Distance Matrix (NxN)", "Snap-to-Road + Isochrone", "Debug (Last API Call)"])
 
 # -----------------------------
 # TAB 1: GEOCODE & MAP
