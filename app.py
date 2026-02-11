@@ -63,6 +63,77 @@ def normalize_latlng(lat: Any, lng: Any) -> Tuple[Optional[float], Optional[floa
     except Exception:
         return None, None
 
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6371.0088
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lng2 - lng1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlmb/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+def choose_latlng(lat: Any, lng: Any, ref: Tuple[float, float] | None = None) -> Tuple[Optional[float], Optional[float], bool]:
+    lat_f, lng_f, _sw = choose_latlng(lat, lng, ref=(float(ss.center['lat']), float(ss.center['lng'])) if 'center' in ss else None)
+    lat_s, lng_s = normalize_latlng(lng, lat)
+    if lat_f is None and lat_s is None:
+        return None, None, False
+    if lat_f is not None and lat_s is None:
+        return lat_f, lng_f, False
+    if lat_f is None and lat_s is not None:
+        return lat_s, lng_s, True
+    if ref is not None:
+        rlat, rlng = float(ref[0]), float(ref[1])
+        d1 = haversine_km(lat_f, lng_f, rlat, rlng)
+        d2 = haversine_km(lat_s, lng_s, rlat, rlng)
+        if d2 + 1e-6 < d1:
+            return lat_s, lng_s, True
+    return lat_f, lng_f, False
+
+def sanitize_stops_df(df: pd.DataFrame, ref: Tuple[float, float] | None = None) -> Tuple[pd.DataFrame, int]:
+    if df is None or df.empty:
+        return df, 0
+    out = df.copy()
+    swapped = 0
+    for idx, row in out.iterrows():
+        lat = row.get("lat")
+        lng = row.get("lng")
+        if pd.isna(lat) or pd.isna(lng):
+            continue
+        lat2, lng2, did_swap = choose_latlng(lat, lng, ref=ref)
+        if lat2 is None:
+            continue
+        if did_swap:
+            swapped += 1
+            out.at[idx, "lat"] = lat2
+            out.at[idx, "lng"] = lng2
+    if "address" in out.columns:
+        out["address"] = out["address"].astype("string")
+    return out.reset_index(drop=True), swapped
+
+def maybe_fix_session_stops(ref: Tuple[float, float] | None = None) -> int:
+    df2, nsw = sanitize_stops_df(ss.stops_df, ref=ref)
+    if nsw:
+        ss.stops_df = df2
+    return nsw
+
+def fix_points_order(pts: List[Tuple[float, float]], ref: Tuple[float, float] | None = None) -> List[Tuple[float, float]]:
+    if not pts or ref is None:
+        return pts
+    rlat, rlng = float(ref[0]), float(ref[1])
+
+    def median_dist(points):
+        ds = [haversine_km(p[0], p[1], rlat, rlng) for p in points[: min(len(points), 200)]]
+        ds.sort()
+        return ds[len(ds)//2] if ds else 0.0
+
+    d1 = median_dist(pts)
+    swapped_pts = [(p[1], p[0]) for p in pts]
+    d2 = median_dist(swapped_pts)
+    if d1 > 800 and d2 + 1e-6 < d1:
+        return swapped_pts
+    return pts
+
+
 def latlng_str(lat: float, lng: float) -> str:
     return f"{lat:.6f},{lng:.6f}"
 
@@ -109,7 +180,6 @@ def ensure_state():
         ss.vrp = {"create": None, "result": None, "order": None, "job_id": None}
     if "last_json" not in ss:
         ss.last_json = {}
-    ss.api_logs = []  # list of {ts, method, endpoint, params, body, status, response}
     if "last_http" not in ss:
         ss.last_http = {}  # last request/response debug
     if "_region_candidates" not in ss:
@@ -139,7 +209,7 @@ def add_stops(rows: List[Dict[str, Any]], source: str):
         addr = r.get("address") or r.get("name") or ""
         lat = r.get("lat")
         lng = r.get("lng")
-        lat_f, lng_f = normalize_latlng(lat, lng)
+        lat_f, lng_f, _sw = choose_latlng(lat, lng, ref=(float(ss.center['lat']), float(ss.center['lng'])) if 'center' in ss else None)
         if lat_f is None:
             continue
 
@@ -157,31 +227,17 @@ def add_stops(rows: List[Dict[str, Any]], source: str):
     ss.stops_df = df.reset_index(drop=True)
 
 def replace_stops(df_new: pd.DataFrame):
-    # keep types stable
+    # keep types stable + fix lat/lng order (using current center as reference)
     df = df_new.copy()
-    if "address" in df.columns:
-        df["address"] = df["address"].astype("string")
+    ref = None
+    try:
+        ref = (float(ss.center["lat"]), float(ss.center["lng"]))
+    except Exception:
+        ref = None
+    df, _ = sanitize_stops_df(df, ref=ref)
     ss.stops_df = df.reset_index(drop=True)
 
 
-def split_valid_invalid_stops(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (valid, invalid) where valid rows have numeric lat & lng."""
-    if df is None or df.empty:
-        return df.copy(), df.copy()
-    d = df.copy()
-    # Coerce to numeric where possible
-    d["lat_num"] = pd.to_numeric(d.get("lat"), errors="coerce")
-    d["lng_num"] = pd.to_numeric(d.get("lng"), errors="coerce")
-    valid_mask = d["lat_num"].notna() & d["lng_num"].notna()
-    valid = d.loc[valid_mask].copy()
-    invalid = d.loc[~valid_mask].copy()
-    # Restore canonical columns for valid df
-    if not valid.empty:
-        valid["lat"] = valid["lat_num"].astype(float)
-        valid["lng"] = valid["lng_num"].astype(float)
-    valid = valid.drop(columns=["lat_num", "lng_num"], errors="ignore")
-    invalid = invalid.drop(columns=["lat_num", "lng_num"], errors="ignore")
-    return valid.reset_index(drop=True), invalid.reset_index(drop=True)
 def clear_stops():
     ss.stops_df = pd.DataFrame(columns=["label", "address", "lat", "lng", "source"])
     ss.route_before = {"resp": None, "distance_m": None, "duration_s": None, "geometry": []}
@@ -236,26 +292,6 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
         ss.last_http = {"error": str(e), "method": method.upper(), "url": url, "params": params, "body": body}
         return 0, {"error": str(e)}, str(e)
 
-
-def log_api_call(method: str, endpoint: str, params: Optional[Dict[str, Any]], body: Optional[Dict[str, Any]], status: int, response: Any) -> None:
-    """Collects a lightweight audit trail for debugging and easy sharing."""
-    try:
-        entry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "method": method,
-            "endpoint": endpoint,
-            "params": params or {},
-            "body": body or {},
-            "status": status,
-            "response": response,
-        }
-        # Keep logs bounded to avoid ballooning session size
-        ss.api_logs.append(entry)
-        if len(ss.api_logs) > 200:
-            ss.api_logs = ss.api_logs[-200:]
-    except Exception:
-        pass
-
 def nb_get(path: str, params: Dict[str, Any], *, nocache: bool = False) -> Tuple[int, Any]:
     stt, parsed, _ = _http("GET", path, params=params, body=None, nocache=nocache)
     return stt, parsed
@@ -271,7 +307,7 @@ def extract_geocode_candidates(resp: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
 
     def add(name: str, lat: Any, lng: Any, raw: Any):
-        lat_f, lng_f = normalize_latlng(lat, lng)
+        lat_f, lng_f, _sw = choose_latlng(lat, lng, ref=(float(ss.center['lat']), float(ss.center['lng'])) if 'center' in ss else None)
         if lat_f is None:
             return
         out.append({"name": name, "lat": lat_f, "lng": lng_f, "raw": raw})
@@ -288,7 +324,7 @@ def extract_geocode_candidates(resp: Any) -> List[Dict[str, Any]]:
             for it in resp["items"]:
                 if isinstance(it, dict):
                     pos = it.get("position") or {}
-                    name = it.get("title") or it.get("name") or it.get("label") or "Result"
+                    name = it.get("label") or (it.get("address") or {}).get("label") or it.get("title") or it.get("name") or "Result"
                     add(name, pos.get("lat") or it.get("lat"), pos.get("lng") or it.get("lng"), it)
             return out
 
@@ -364,94 +400,56 @@ def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, 
 
     return coordinates
 
-
-def choose_latlng_from_pair(pair: List[float], ref: Optional[Tuple[float, float]] = None) -> Optional[Tuple[float, float]]:
-    """Accepts [a,b] where order may be [lat,lng] or [lng,lat]. Uses ref to decide."""
-    if not isinstance(pair, (list, tuple)) or len(pair) < 2:
-        return None
-    a, b = pair[0], pair[1]
-    try:
-        a = float(a); b = float(b)
-    except Exception:
-        return None
-
-    cand1 = normalize_latlng(a, b)  # assume lat,lng
-    cand2 = normalize_latlng(b, a)  # assume lng,lat
-    if cand1 is None and cand2 is None:
-        return None
-    if cand1 is not None and cand2 is None:
-        return cand1
-    if cand2 is not None and cand1 is None:
-        return cand2
-
-    # both valid – use reference point to decide (pick the closer one)
-    if ref is None:
-        return cand1
-    rlat, rlng = ref
-    d1 = (cand1[0] - rlat) ** 2 + (cand1[1] - rlng) ** 2
-    d2 = (cand2[0] - rlat) ** 2 + (cand2[1] - rlng) ** 2
-    return cand1 if d1 <= d2 else cand2
-
-
-def extract_route_geometry(route_json: Any, ref: Optional[Tuple[float, float]] = None) -> List[Tuple[float, float]]:
-    """Extracts a list of (lat,lng) points from NextBillion directions response."""
-    if not isinstance(route_json, dict):
+def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
+    if not isinstance(resp, dict):
         return []
-    routes = route_json.get("routes") or route_json.get("data", {}).get("routes")
-    if not isinstance(routes, list) or not routes:
+
+    # GeoJSON FeatureCollection
+    if resp.get("type") == "FeatureCollection" and "features" in resp:
+        for f in resp["features"]:
+            geom = (f or {}).get("geometry") or {}
+            if geom.get("type") == "LineString":
+                coords = geom.get("coordinates") or []
+                pts = []
+                for c in coords:
+                    if isinstance(c, list) and len(c) >= 2:
+                        lng, lat = c[0], c[1]
+                        lat_f, lng_f, _sw = choose_latlng(lat, lng, ref=(float(ss.center['lat']), float(ss.center['lng'])) if 'center' in ss else None)
+                        if lat_f is not None:
+                            pts.append((lat_f, lng_f))
+                if pts:
+                    return fix_points_order(pts, ref=(float(ss.center['lat']), float(ss.center['lng'])) if 'center' in ss else None)
+
+    routes = resp.get("routes") or []
+    if isinstance(routes, dict):
+        routes = [routes]
+    if not routes:
         return []
+
     r0 = routes[0] if isinstance(routes[0], dict) else {}
-    geom = r0.get("geometry") or r0.get("polyline") or r0.get("points")
+    poly = r0.get("geometry") or r0.get("polyline") or (r0.get("overview_polyline") or {}).get("points")
 
-    # geometry can be:
-    # - encoded polyline string
-    # - list of [lng,lat] pairs (GeoJSON-like)
-    # - dict with 'coordinates'
-    if isinstance(geom, str) and geom.strip():
-        pts5 = decode_polyline(geom, precision=5)
-        pts6 = decode_polyline(geom, precision=6)
-        # choose the one that is closer to ref (or the one that yields sane coordinates)
-        if ref is None:
-            return pts5 if pts5 else pts6
-        def score(pts: List[Tuple[float, float]]) -> float:
-            if not pts:
-                return 1e18
-            rlat, rlng = ref
-            plat, plng = pts[0]
-            return (plat - rlat) ** 2 + (plng - rlng) ** 2
-        return pts5 if score(pts5) <= score(pts6) else pts6
+    if isinstance(poly, str) and poly.strip():
+        pts5 = decode_polyline(poly, precision=5)
+        pts6 = decode_polyline(poly, precision=6)
+        pts = pts6 if len(pts6) > len(pts5) else pts5
+        if len(pts) >= 2:
+            return fix_points_order(pts, ref=(float(ss.center['lat']), float(ss.center['lng'])) if 'center' in ss else None)
 
-    if isinstance(geom, dict):
-        coords = geom.get("coordinates")
-        if isinstance(coords, list):
-            out: List[Tuple[float, float]] = []
-            for p in coords:
-                if isinstance(p, (list, tuple)) and len(p) >= 2:
-                    ll = choose_latlng_from_pair(list(p), ref=ref)
-                    if ll:
-                        out.append(ll)
-            return out
-
+    geom = r0.get("geometry")
     if isinstance(geom, list):
-        out: List[Tuple[float, float]] = []
+        pts = []
         for p in geom:
-            if isinstance(p, (list, tuple)) and len(p) >= 2:
-                ll = choose_latlng_from_pair(list(p), ref=ref)
-                if ll:
-                    out.append(ll)
-        return out
-
-    # fallback: scan legs/steps
-    legs = r0.get("legs")
-    if isinstance(legs, list):
-        pts: List[Tuple[float, float]] = []
-        for leg in legs:
-            steps = leg.get("steps") if isinstance(leg, dict) else None
-            if isinstance(steps, list):
-                for stp in steps:
-                    if isinstance(stp, dict) and isinstance(stp.get("geometry"), str):
-                        pts.extend(decode_polyline(stp["geometry"], precision=5))
-        return pts
+            if isinstance(p, dict):
+                lat_f, lng_f = normalize_latlng(p.get("lat"), p.get("lng"))
+                if lat_f is not None:
+                    pts.append((lat_f, lng_f))
+            elif isinstance(p, list) and len(p) >= 2:
+                lat_f, lng_f = normalize_latlng(p[0], p[1])
+                if lat_f is not None:
+                    pts.append((lat_f, lng_f))
+        if len(pts) >= 2:
+            return fix_points_order(pts, ref=(float(ss.center['lat']), float(ss.center['lng'])) if 'center' in ss else None)
 
     return []
 
@@ -579,31 +577,19 @@ def build_global_route_params(ui: Dict[str, Any]) -> Dict[str, Any]:
         p["overview"] = ui["overview"]
     return p
 
-
-def geocode_forward(query: str, at_lat: float, at_lng: float, country_code: str = "") -> Tuple[int, Any]:
-    """Forward geocode using Places Forward API: GET /geocode?q=...&at=lat,lng&in=countryCode:XX"""
-    params: Dict[str, Any] = {
-        "key": NB_API_KEY,
-        "q": query,
-        "at": latlng_str(at_lat, at_lng),
-    }
-    if country_code.strip():
-        params["in"] = f"countryCode:{country_code.strip().upper()}"
-
-    ss.last_json["geocode_forward_params"] = params
+def geocode_forward(query: str, country: str, language: str) -> Tuple[int, Any]:
+    params = {"key": NB_API_KEY, "q": query, "country": country, "language": language}
     stt, data = nb_get("/geocode", params=params)
-    ss.last_json["geocode_forward_response"] = data
+    if stt == 404:
+        stt, data = nb_get("/geocode/v1", params=params)
     return stt, data
 
-
-def geocode_reverse(lat: float, lng: float) -> Tuple[int, Any]:
-    """Reverse geocode using Places Reverse API: GET /revgeocode?at=lat,lng"""
-    params = {"key": NB_API_KEY, "at": latlng_str(lat, lng)}
-    ss.last_json["geocode_reverse_params"] = params
-
+def geocode_reverse(lat: float, lng: float, language: str) -> Tuple[int, Any]:
+    # Reverse Geocode API: /revgeocode?at=lat,lng&key=...
+    params = {"key": NB_API_KEY, "at": f"{float(lat):.6f},{float(lng):.6f}", "language": language}
     stt, data = nb_get("/revgeocode", params=params)
-    ss.last_json["geocode_reverse_response"] = data
     return stt, data
+
 
 def distance_matrix(origins: List[str], destinations: List[str], params_extra: Dict[str, Any]) -> Tuple[int, Any]:
     params = dict(params_extra)
@@ -658,23 +644,15 @@ def build_vrp_payload_v2(stops: pd.DataFrame, objective: str, routing_mode: str,
     }
     return payload
 
-
 def validate_vrp_payload_v2(body: Dict[str, Any]) -> Tuple[bool, str]:
-    # Docs and examples show `locations` sometimes as an object, sometimes as a single-item array.
     locs = body.get("locations")
-    if isinstance(locs, list):
-        if not locs:
-            return False, "VRP payload invalid: 'locations' list is empty."
-        locs = locs[0]
     if not isinstance(locs, dict):
-        return False, "VRP payload invalid: 'locations' must be an object (or a single-item list) with field 'location' as an array."
-
+        return False, "VRP payload invalid: 'locations' must be an object with field 'location' as an array."
     loc_arr = locs.get("location")
-    if not isinstance(loc_arr, list) or not loc_arr:
+    if not isinstance(loc_arr, list) or not loc_arr or not all(isinstance(x, str) and "," in x for x in loc_arr):
         return False, "VRP payload invalid: locations.location must be a non-empty array of 'lat,lng' strings."
-    if not all(isinstance(x, str) and "," in x for x in loc_arr):
-        return False, "VRP payload invalid: locations.location must contain 'lat,lng' strings."
     return True, "OK"
+
 def vrp_create_v2(body: Dict[str, Any]) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY}
     stt, data = nb_post("/optimization/v2", params=params, body=body)
@@ -860,6 +838,7 @@ tabs = st.tabs(["Geocode & Map", "Places (Search + Generate Stops)", "Route + Op
 # -----------------------------
 with tabs[0]:
     st.subheader("Geocode your stops and show them on the map")
+    maybe_fix_session_stops(ref=(float(ss.center["lat"]), float(ss.center["lng"])))
     gcol1, gcol2 = st.columns([1, 1])
     with gcol1:
         country = st.text_input("Country filter (3-letter)", value=ss.center["country"], key="geo_country")
@@ -876,7 +855,7 @@ with tabs[0]:
             addr = str(row.get("address") or "").strip()
             if not addr:
                 continue
-            status, resp = geocode_forward(addr, float(ss.center["lat"]), float(ss.center["lng"]), country_code=ss.center["country"])
+            status, resp = geocode_forward(addr, country=ss.center["country"], language=language)
             last_resp = resp
             candidates = extract_geocode_candidates(resp)
             if candidates:
@@ -909,6 +888,7 @@ with tabs[0]:
 # -----------------------------
 with tabs[1]:
     st.subheader("Search region/city → set center → generate 20+ random stops OR add POIs as stops")
+    maybe_fix_session_stops(ref=(float(ss.center["lat"]), float(ss.center["lng"])))
     rcol1, rcol2 = st.columns([3, 1])
     with rcol1:
         region_q = st.text_input("Region/City/State/Country", value="", key="pl_region_q")
@@ -916,7 +896,7 @@ with tabs[1]:
         pl_country = st.text_input("Country filter (3-letter)", value=ss.center["country"], key="pl_country")
 
     if st.button("Search Region", key="pl_search_region"):
-        status, resp = geocode_forward(region_q, float(ss.center["lat"]), float(ss.center["lng"]), country_code=pl_country.strip().upper()[:3])
+        status, resp = geocode_forward(region_q, country=pl_country.strip().upper()[:3], language=language)
         ss.last_json["region_search_response"] = resp
         ss._region_candidates = extract_geocode_candidates(resp)
 
@@ -976,7 +956,7 @@ with tabs[1]:
             df["address"] = df["address"].astype("string")
             for idx, row in df[df["source"].str.contains("Random around center", na=False)].iterrows():
                 try:
-                    status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]))
+                    status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
                     cand = extract_geocode_candidates(rresp)
                     if cand:
                         df.loc[idx, "address"] = str(cand[0]["name"])
@@ -995,20 +975,13 @@ with tabs[1]:
 # -----------------------------
 with tabs[2]:
     st.subheader("Compute route (Before) → run optimization → recompute route (After) + compare")
+    maybe_fix_session_stops(ref=(float(ss.center["lat"]), float(ss.center["lng"])))
 
     if len(ss.stops_df) < 2:
         st.info("Add at least 2 stops first.")
     else:
-        df_valid, df_invalid = split_valid_invalid_stops(ss.stops_df)
-        if not df_invalid.empty:
-            st.warning("Some stops are missing lat/lng. These rows will be skipped for route/optimization until you geocode or fill lat/lng.")
-            st.dataframe(df_invalid[["label","address","lat","lng","source"]], width="stretch", height=180)
-        if len(df_valid) < 2:
-            st.error("After removing invalid rows, you have fewer than 2 valid stops. Please geocode/fix the missing coordinates.")
-            st.stop()
-
-        stops_ll = [latlng_str(float(r.lat), float(r.lng)) for r in df_valid.itertuples()]
-
+        df_s, _ = sanitize_stops_df(ss.stops_df, ref=(float(ss.center['lat']), float(ss.center['lng'])))
+        stops_ll = [latlng_str(float(r.lat), float(r.lng)) for r in df_s.itertuples()]
 
         left, right = st.columns([1.15, 1.0])
 
@@ -1051,7 +1024,7 @@ with tabs[2]:
             before_geom = ss.route_before.get("geometry") or []
             m_before = make_map(
                 center=(float(ss.center["lat"]), float(ss.center["lng"])),
-                stops=df_valid,
+                stops=ss.stops_df,
                 route_pts=before_geom if before_geom else None,
                 clicked=ss.clicked_pin,
                 zoom=12,
@@ -1084,7 +1057,7 @@ with tabs[2]:
                 if override is None:
                     st.stop()
 
-                base = build_vrp_payload_v2(df_valid, objective=objective, routing_mode=routing_mode, traffic_ts=int(traffic_ts))
+                base = build_vrp_payload_v2(ss.stops_df, objective=objective, routing_mode=routing_mode, traffic_ts=int(traffic_ts))
                 body = deep_merge(base, override or {})
 
                 ok, msg = validate_vrp_payload_v2(body)
@@ -1129,7 +1102,7 @@ with tabs[2]:
             order = ss.vrp.get("order")
 
             if order:
-                df2 = df_valid.copy().reset_index(drop=True)
+                df2 = ss.stops_df.copy().reset_index(drop=True)
                 valid = [i for i in order if 0 <= i < len(df2)]
                 missing = [i for i in range(len(df2)) if i not in valid]
                 final_order = valid + missing
@@ -1137,7 +1110,7 @@ with tabs[2]:
                 ss._optimized_stops = df_after
             else:
                 if df_after is None:
-                    df_after = df_valid.copy()
+                    df_after = ss.stops_df.copy()
 
             if st.button("🧭 Compute route (After)", key="rt_after_btn", width="stretch"):
                 override = safe_json_loads(dir_after_override_text)
@@ -1208,6 +1181,7 @@ with tabs[2]:
 # -----------------------------
 with tabs[3]:
     st.subheader("Distance Matrix (NxN) — up to 20+ points")
+    maybe_fix_session_stops(ref=(float(ss.center["lat"]), float(ss.center["lng"])))
 
     if len(ss.stops_df) < 2:
         st.info("Add at least 2 stops first.")
@@ -1224,7 +1198,8 @@ with tabs[3]:
         if use_first_n == "First N stops":
             df_use = df_use.iloc[:n].reset_index(drop=True)
 
-        ll = [latlng_str(float(r.lat), float(r.lng)) for r in df_use.itertuples()]
+        df_use_s, _ = sanitize_stops_df(df_use, ref=(float(ss.center['lat']), float(ss.center['lng'])))
+        ll = [latlng_str(float(r.lat), float(r.lng)) for r in df_use_s.itertuples()]
 
         if st.button("📐 Compute Distance Matrix (NxN)", key="mx_btn", width="stretch"):
             stt, data = distance_matrix(ll, ll, params_extra=GLOBAL_PARAMS)
