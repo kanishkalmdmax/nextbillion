@@ -162,6 +162,25 @@ def replace_stops(df_new: pd.DataFrame):
         df["address"] = df["address"].astype("string")
     ss.stops_df = df.reset_index(drop=True)
 
+
+def split_valid_invalid_stops(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (valid, invalid) where valid rows have numeric lat & lng."""
+    if df is None or df.empty:
+        return df.copy(), df.copy()
+    d = df.copy()
+    # Coerce to numeric where possible
+    d["lat_num"] = pd.to_numeric(d.get("lat"), errors="coerce")
+    d["lng_num"] = pd.to_numeric(d.get("lng"), errors="coerce")
+    valid_mask = d["lat_num"].notna() & d["lng_num"].notna()
+    valid = d.loc[valid_mask].copy()
+    invalid = d.loc[~valid_mask].copy()
+    # Restore canonical columns for valid df
+    if not valid.empty:
+        valid["lat"] = valid["lat_num"].astype(float)
+        valid["lng"] = valid["lng_num"].astype(float)
+    valid = valid.drop(columns=["lat_num", "lng_num"], errors="ignore")
+    invalid = invalid.drop(columns=["lat_num", "lng_num"], errors="ignore")
+    return valid.reset_index(drop=True), invalid.reset_index(drop=True)
 def clear_stops():
     ss.stops_df = pd.DataFrame(columns=["label", "address", "lat", "lng", "source"])
     ss.route_before = {"resp": None, "distance_m": None, "duration_s": None, "geometry": []}
@@ -568,15 +587,23 @@ def build_vrp_payload_v2(stops: pd.DataFrame, objective: str, routing_mode: str,
     }
     return payload
 
-def validate_vrp_payload_v2(body: Dict[str, Any]) -> Tuple[bool, str]:
-    locs = body.get("locations")
-    if not isinstance(locs, dict):
-        return False, "VRP payload invalid: 'locations' must be an object with field 'location' as an array."
-    loc_arr = locs.get("location")
-    if not isinstance(loc_arr, list) or not loc_arr or not all(isinstance(x, str) and "," in x for x in loc_arr):
-        return False, "VRP payload invalid: locations.location must be a non-empty array of 'lat,lng' strings."
-    return True, "OK"
 
+def validate_vrp_payload_v2(body: Dict[str, Any]) -> Tuple[bool, str]:
+    # Docs and examples show `locations` sometimes as an object, sometimes as a single-item array.
+    locs = body.get("locations")
+    if isinstance(locs, list):
+        if not locs:
+            return False, "VRP payload invalid: 'locations' list is empty."
+        locs = locs[0]
+    if not isinstance(locs, dict):
+        return False, "VRP payload invalid: 'locations' must be an object (or a single-item list) with field 'location' as an array."
+
+    loc_arr = locs.get("location")
+    if not isinstance(loc_arr, list) or not loc_arr:
+        return False, "VRP payload invalid: locations.location must be a non-empty array of 'lat,lng' strings."
+    if not all(isinstance(x, str) and "," in x for x in loc_arr):
+        return False, "VRP payload invalid: locations.location must contain 'lat,lng' strings."
+    return True, "OK"
 def vrp_create_v2(body: Dict[str, Any]) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY}
     stt, data = nb_post("/optimization/v2", params=params, body=body)
@@ -901,7 +928,16 @@ with tabs[2]:
     if len(ss.stops_df) < 2:
         st.info("Add at least 2 stops first.")
     else:
-        stops_ll = [latlng_str(float(r.lat), float(r.lng)) for r in ss.stops_df.itertuples()]
+        df_valid, df_invalid = split_valid_invalid_stops(ss.stops_df)
+        if not df_invalid.empty:
+            st.warning("Some stops are missing lat/lng. These rows will be skipped for route/optimization until you geocode or fill lat/lng.")
+            st.dataframe(df_invalid[["label","address","lat","lng","source"]], width="stretch", height=180)
+        if len(df_valid) < 2:
+            st.error("After removing invalid rows, you have fewer than 2 valid stops. Please geocode/fix the missing coordinates.")
+            st.stop()
+
+        stops_ll = [latlng_str(float(r.lat), float(r.lng)) for r in df_valid.itertuples()]
+
 
         left, right = st.columns([1.15, 1.0])
 
@@ -944,7 +980,7 @@ with tabs[2]:
             before_geom = ss.route_before.get("geometry") or []
             m_before = make_map(
                 center=(float(ss.center["lat"]), float(ss.center["lng"])),
-                stops=ss.stops_df,
+                stops=df_valid,
                 route_pts=before_geom if before_geom else None,
                 clicked=ss.clicked_pin,
                 zoom=12,
@@ -977,7 +1013,7 @@ with tabs[2]:
                 if override is None:
                     st.stop()
 
-                base = build_vrp_payload_v2(ss.stops_df, objective=objective, routing_mode=routing_mode, traffic_ts=int(traffic_ts))
+                base = build_vrp_payload_v2(df_valid, objective=objective, routing_mode=routing_mode, traffic_ts=int(traffic_ts))
                 body = deep_merge(base, override or {})
 
                 ok, msg = validate_vrp_payload_v2(body)
@@ -1022,7 +1058,7 @@ with tabs[2]:
             order = ss.vrp.get("order")
 
             if order:
-                df2 = ss.stops_df.copy().reset_index(drop=True)
+                df2 = df_valid.copy().reset_index(drop=True)
                 valid = [i for i in order if 0 <= i < len(df2)]
                 missing = [i for i in range(len(df2)) if i not in valid]
                 final_order = valid + missing
@@ -1030,7 +1066,7 @@ with tabs[2]:
                 ss._optimized_stops = df_after
             else:
                 if df_after is None:
-                    df_after = ss.stops_df.copy()
+                    df_after = df_valid.copy()
 
             if st.button("🧭 Compute route (After)", key="rt_after_btn", width="stretch"):
                 override = safe_json_loads(dir_after_override_text)
