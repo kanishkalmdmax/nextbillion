@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
+import hashlib
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
@@ -280,6 +281,40 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
         params = dict(params)
         params["_ts"] = int(time.time() * 1000)
 
+
+    # lightweight in-session cache to prevent Streamlit reruns from re-hitting APIs repeatedly
+    # cache key excludes headers; includes method, url, params, and body
+    if not nocache:
+        try:
+            if "http_cache" not in ss:
+                ss.http_cache = {}
+            cache_key_obj = {"m": method.upper(), "u": url, "p": params, "b": body}
+            cache_key = hashlib.sha256(json.dumps(cache_key_obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+            cached = ss.http_cache.get(cache_key)
+            if cached:
+                ts, status_c, parsed_c, raw_c = cached
+                # 60s ttl
+                if time.time() - ts <= 60:
+                    entry = {
+                        "context": context,
+                        "method": method.upper(),
+                        "url": url,
+                        "params": params,
+                        "body": body,
+                        "status": status_c,
+                        "response_headers": {"cached": "true"},
+                        "raw_text": (raw_c or "")[:20000],
+                        "parsed": parsed_c,
+                    }
+                    ss.last_http = entry
+                    if "http_logs" not in ss:
+                        ss.http_logs = []
+                    ss.http_logs.append(entry)
+                    if len(ss.http_logs) > 200:
+                        ss.http_logs = ss.http_logs[-200:]
+                    return status_c, parsed_c, raw_c or ""
+        except Exception:
+            pass
     try:
         if method.upper() == "GET":
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
@@ -313,6 +348,15 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
         if len(ss.http_logs) > 200:
             ss.http_logs = ss.http_logs[-200:]
 
+
+        # store in cache (best-effort)
+        if not nocache:
+            try:
+                if "http_cache" not in ss:
+                    ss.http_cache = {}
+                ss.http_cache[cache_key] = (time.time(), r.status_code, parsed, raw)
+            except Exception:
+                pass
         return r.status_code, parsed, raw
 
     except Exception as e:
@@ -702,33 +746,51 @@ def geocode_reverse(lat: float, lng: float, language: str) -> Tuple[int, Any]:
 
 
 def distance_matrix(origins: List[str], destinations: List[str], params_extra: Dict[str, Any]) -> Tuple[int, Any]:
-    """Distance Matrix wrapper with fallback for entitlement/region issues.
+    """Distance Matrix wrapper.
 
-    If the account/region isn't enabled for the selected mode (commonly 'truck'),
-    retry once with mode='car' so the UI can still render results, and record it.
+    Key behaviors:
+    - If departure_time is provided, automatically set option=flexible (required by NB).
+    - Use POST when total locations are large to avoid URL length/413 errors.
+    - If account/region isn't enabled for the selected mode (commonly 'truck'),
+      retry once with mode='car' so the UI can still render results, and record it.
     """
-    params = dict(params_extra)
+    params = dict(params_extra) if params_extra else {}
     params["origins"] = "|".join(origins)
     params["destinations"] = "|".join(destinations)
+
+    # departure_time requires Flexible API (option=flexible) per NB docs
+    if params.get("departure_time") is not None:
+        params["option"] = "flexible"
 
     requested_mode = params.get("mode")
     used_mode = requested_mode
 
-    stt, data = nb_get("/distancematrix/json", params=params)
-    if stt == 404:
-        stt, data = nb_get("/distancematrix", params=params)
+    def _call(p: Dict[str, Any]) -> Tuple[int, Any]:
+        # Use POST if large matrix to avoid URL length errors (NB recommends POST when >100 total origins+destinations)
+        total_locs = len(origins) + len(destinations)
+        if total_locs > 100:
+            qp = {k: v for k, v in p.items() if k in ("key", "option")}
+            body = {k: v for k, v in p.items() if k not in ("key", "option")}
+            stt, data = nb_post("/distancematrix/json", params=qp, body=body, context="Distance Matrix")
+            if stt == 404:
+                stt, data = nb_post("/distancematrix", params=qp, body=body, context="Distance Matrix")
+            return stt, data
+        else:
+            stt, data = nb_get("/distancematrix/json", params=p, context="Distance Matrix")
+            if stt == 404:
+                stt, data = nb_get("/distancematrix", params=p, context="Distance Matrix")
+            return stt, data
+
+    stt, data = _call(params)
 
     if stt == 403 and isinstance(data, dict):
         msg = str(data.get("msg") or "")
         if "Service not enabled" in msg and requested_mode and str(requested_mode) != "car":
-            # note original failure + fallback
             note_mode_fallback("Distance Matrix", str(requested_mode), "car", stt, data)
             params2 = dict(params)
             params2["mode"] = "car"
             used_mode = "car"
-            stt, data = nb_get("/distancematrix/json", params=params2)
-            if stt == 404:
-                stt, data = nb_get("/distancematrix", params=params2)
+            stt, data = _call(params2)
 
     # persist requested/used (even if no fallback)
     try:
