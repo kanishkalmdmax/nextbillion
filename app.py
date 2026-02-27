@@ -267,10 +267,10 @@ def clear_stops():
 # -----------------------------
 # HTTP (debuggable)
 # -----------------------------
-def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None, timeout: int = 60, nocache: bool = False) -> Tuple[int, Any, str]:
+def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None, timeout: int = 60, nocache: bool = False, context: str = "") -> Tuple[int, Any, str]:
     """
-    Returns (status_code, parsed_json_or_text, raw_text)
-    Stores request/response in ss.last_http for debugging.
+    Returns (status_code, parsed_json_or_text, raw_text).
+    Stores request/response in ss.last_http and appends to ss.http_logs for debugging.
     """
     url = NB_BASE + path
     params = params or {}
@@ -293,7 +293,8 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
         except Exception:
             parsed = raw
 
-        ss.last_http = {
+        entry = {
+            "context": context,
             "method": method.upper(),
             "url": url,
             "params": params,
@@ -303,20 +304,34 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
             "raw_text": raw[:20000],
             "parsed": parsed,
         }
+        ss.last_http = entry
+
+        if "http_logs" not in ss:
+            ss.http_logs = []
+        ss.http_logs.append(entry)
+        # keep last 200
+        if len(ss.http_logs) > 200:
+            ss.http_logs = ss.http_logs[-200:]
+
         return r.status_code, parsed, raw
 
     except Exception as e:
-        ss.last_http = {"error": str(e), "method": method.upper(), "url": url, "params": params, "body": body}
+        entry = {"context": context, "error": str(e), "method": method.upper(), "url": url, "params": params, "body": body}
+        ss.last_http = entry
+        if "http_logs" not in ss:
+            ss.http_logs = []
+        ss.http_logs.append(entry)
+        if len(ss.http_logs) > 200:
+            ss.http_logs = ss.http_logs[-200:]
         return 0, {"error": str(e)}, str(e)
 
-def nb_get(path: str, params: Dict[str, Any], *, nocache: bool = False) -> Tuple[int, Any]:
-    stt, parsed, _ = _http("GET", path, params=params, body=None, nocache=nocache)
+def nb_get(path: str, params: Dict[str, Any], *, nocache: bool = False, context: str = "") -> Tuple[int, Any]:
+    stt, parsed, _ = _http("GET", path, params=params, body=None, nocache=nocache, context=context)
     return stt, parsed
 
-def nb_post(path: str, params: Dict[str, Any], body: Dict[str, Any], *, nocache: bool = False) -> Tuple[int, Any]:
-    stt, parsed, _ = _http("POST", path, params=params, body=body, nocache=nocache)
+def nb_post(path: str, params: Dict[str, Any], body: Dict[str, Any], *, nocache: bool = False, context: str = "") -> Tuple[int, Any]:
+    stt, parsed, _ = _http("POST", path, params=params, body=body, nocache=nocache, context=context)
     return stt, parsed
-
 
 def show_api_error(context: str, status: int, resp: Any) -> None:
     """Display API error (status>=400) in the UI with a clear message."""
@@ -630,7 +645,7 @@ def build_global_route_params(ui: Dict[str, Any]) -> Dict[str, Any]:
 
     avoid_list = ui.get("avoid") or []
     if avoid_list:
-        p["avoid"] = ",".join(avoid_list)
+        p["avoid"] = "|".join(avoid_list)
 
     if ui.get("traffic") is not None:
         p["traffic"] = "true" if ui["traffic"] else "false"
@@ -639,6 +654,38 @@ def build_global_route_params(ui: Dict[str, Any]) -> Dict[str, Any]:
     if ui.get("overview"):
         p["overview"] = ui["overview"]
     return p
+
+
+def sanitize_route_params(p: dict) -> tuple[dict, list[str]]:
+    """Coerce/validate common routing params to match NB expectations.
+    Returns (params, warnings). Does not mutate input.
+    """
+    out = dict(p or {})
+    warns: list[str] = []
+
+    # avoid must be string like 'toll|highway' (or single value). Some overrides mistakenly send an object/dict.
+    if "avoid" in out:
+        av = out["avoid"]
+        if isinstance(av, dict):
+            warns.append("Invalid 'avoid' format: object/dict not supported. Use string like 'toll|highway' or list of strings.")
+            out.pop("avoid", None)
+        elif isinstance(av, list):
+            # filter to strings
+            av_s = [str(x).strip() for x in av if str(x).strip()]
+            if av_s:
+                out["avoid"] = "|".join(av_s)
+            else:
+                out.pop("avoid", None)
+        elif isinstance(av, str):
+            # normalize separators to '|'
+            out["avoid"] = av.replace(",", "|").replace(";", "|").strip()
+            if not out["avoid"]:
+                out.pop("avoid", None)
+        else:
+            warns.append("Invalid 'avoid' type. Use string or list of strings.")
+            out.pop("avoid", None)
+
+    return out, warns
 
 def geocode_forward(query: str, country: str, language: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY, "q": query, "country": country, "language": language}
@@ -695,11 +742,13 @@ def distance_matrix(origins: List[str], destinations: List[str], params_extra: D
 
     return stt, data
 
-def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any], override_params: Dict[str, Any] | None = None) -> Tuple[int, Any]:
-    """Directions wrapper (multi-stop) with fallback for entitlement/region issues.
-
-    If we get 403 'Service not enabled...' for a requested mode (commonly 'truck'),
-    retry once with mode='car' and record/display the fallback.
+def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any], override_params: Dict[str, Any] | None = None, *, context: str = "Directions") -> Tuple[int, Any]:
+    """
+    Directions wrapper (multi-stop) with:
+      - param sanitation (notably avoid),
+      - automatic switch to POST when GET would exceed limits,
+      - flexible option when advanced params used,
+      - fallback from truck->car for entitlement/region issues (records both calls in logs).
     """
     if len(order_latlng) < 2:
         return 0, {"error": "Need at least 2 points"}
@@ -708,43 +757,91 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any],
     dest = order_latlng[-1]
     waypoints = order_latlng[1:-1]
 
-    params = dict(params_extra)
+    # base params from UI/global
+    params = dict(params_extra) if params_extra else {}
     params["origin"] = origin
     params["destination"] = dest
     if waypoints:
         params["waypoints"] = "|".join(waypoints)
 
+    # apply override params (from JSON textarea)
     if override_params:
-        params = deep_merge(params, override_params)
+        params.update(override_params)
 
-    requested_mode = params.get("mode")
-    used_mode = requested_mode
+    # sanitize / normalize (avoid, etc)
+    params, warns = sanitize_route_params(params)
+    for w in warns:
+        st.warning(f"{context}: {w}")
 
-    stt, data = nb_get("/directions/json", params=params)
-    if stt == 404:
-        stt, data = nb_get("/directions", params=params)
+    # decide whether to use flexible: departure_time & traffic are not supported by fast endpoint (warnings seen in your logs),
+    # so we enable flexible when those are requested. (NB docs recommend option=flexible for these). 
+    # https://docs.nextbillion.ai/routing/directions-api
+    use_flexible = False
+    if "departure_time" in params and params.get("departure_time"):
+        use_flexible = True
+    if "traffic" in params:
+        use_flexible = True
 
-    if stt == 403 and isinstance(data, dict):
-        msg = str(data.get("msg") or "")
-        if "Service not enabled" in msg and requested_mode and str(requested_mode) != "car":
-            note_mode_fallback("Directions", str(requested_mode), "car", stt, data)
-            params2 = dict(params)
-            params2["mode"] = "car"
-            used_mode = "car"
-            stt, data = nb_get("/directions/json", params=params2)
-            if stt == 404:
-                stt, data = nb_get("/directions", params=params2)
+    # determine GET vs POST based on waypoint count and URI length constraints
+    # NB docs: max waypoints per request is 50 with GET, 200 with POST. 
+    # https://docs.nextbillion.ai/routing/directions-api
+    wp_count = len(waypoints)
+    # approximate URL length contribution
+    wp_str = params.get("waypoints", "")
+    too_many_for_get = wp_count >= 48  # keep buffer below 50
+    too_long_for_get = len(wp_str) > 1500
 
-    try:
-        ss = st.session_state
-        if "last_json" not in ss:
-            ss.last_json = {}
-        ss.last_json["directions_requested_mode"] = requested_mode
-        ss.last_json["directions_used_mode"] = used_mode
-    except Exception:
-        pass
+    method = "GET"
+    body: Dict[str, Any] | None = None
+    qparams = dict(params)
 
-    return stt, data
+    if use_flexible:
+        qparams["option"] = "flexible"
+
+    if too_many_for_get or too_long_for_get:
+        # use POST. For flexible POST, key & option in query, rest in body.
+        method = "POST"
+        body = dict(qparams)
+        # key/option should be query
+        qparams = {"key": body.pop("key", None)}
+        if use_flexible:
+            qparams["option"] = "flexible"
+            body.pop("option", None)
+
+    def do_call(call_params: Dict[str, Any], call_body: Dict[str, Any] | None, call_context: str) -> Tuple[int, Any]:
+        if method == "GET":
+            return nb_get("/directions/json", call_params, context=call_context)
+        return nb_post("/directions/json", call_params, call_body or {}, context=call_context)
+
+    # First attempt (requested mode)
+    requested_mode = (params.get("mode") or "").strip() or "car"
+    stt, resp = do_call(qparams, body, f"{context} ({requested_mode})")
+
+    # Store request params for sharing (include both query & body)
+    ss.last_json[f"{context.lower().replace(' ','_')}_request"] = {"method": method, "url": NB_BASE + "/directions/json", "params": qparams, "body": body}
+    ss.last_json[f"{context.lower().replace(' ','_')}_requested_mode"] = requested_mode
+    ss.last_json[f"{context.lower().replace(' ','_')}_used_mode"] = requested_mode
+
+    # If 403 "service not enabled" or similar entitlement issue, fallback truck->car only (do not mask other errors)
+    if stt == 403 and requested_mode == "truck":
+        msg = resp.get("msg") if isinstance(resp, dict) else str(resp)
+        st.warning(f"{context}: 'truck' failed (HTTP 403). Falling back to 'car'. Message: {msg}")
+        # retry with car
+        if method == "GET":
+            q2 = dict(qparams)
+            q2["mode"] = "car"
+            stt2, resp2 = nb_get("/directions/json", q2, context=f"{context} (fallback car)")
+        else:
+            b2 = dict(body or {})
+            b2["mode"] = "car"
+            stt2, resp2 = nb_post("/directions/json", qparams, b2, context=f"{context} (fallback car)")
+
+        ss.last_json[f"{context.lower().replace(' ','_')}_used_mode"] = "car"
+        # keep original failure too
+        ss.last_json[f"{context.lower().replace(' ','_')}_truck_failure"] = {"status": stt, "resp": resp}
+        return stt2, resp2
+
+    return stt, resp
 
 def build_vrp_payload_v2(stops: pd.DataFrame, objective: str, routing_mode: str, traffic_ts: int) -> Dict[str, Any]:
     loc_list: List[str] = []
@@ -910,8 +1007,6 @@ GLOBAL_PARAMS = build_global_route_params(global_ui)
 
 with st.sidebar:
     st.header("Config")
-    st.text_input("NextBillion API Key", value=NB_API_KEY, type="password", key="sb_key", disabled=True)
-
     st.divider()
     st.subheader("Stops (paste / edit)")
 
@@ -1121,7 +1216,7 @@ with tabs[2]:
                 if override is None:
                     st.stop()
 
-                stt_d, resp_d = directions_multi_stop(stops_ll, params_extra=GLOBAL_PARAMS, override_params=override)
+                stt_d, resp_d = directions_multi_stop(stops_ll, params_extra=GLOBAL_PARAMS, override_params=override, context='Directions Before')
                 ss.route_before["resp"] = resp_d
                 ss.last_json["directions_before"] = resp_d
                 ss.last_json["directions_before_status"] = stt_d
@@ -1247,7 +1342,7 @@ with tabs[2]:
                     st.stop()
 
                 ll_after = [latlng_str(float(r.lat), float(r.lng)) for r in df_after.itertuples()]
-                stt_d2, resp_d2 = directions_multi_stop(ll_after, params_extra=GLOBAL_PARAMS, override_params=override)
+                stt_d2, resp_d2 = directions_multi_stop(ll_after, params_extra=GLOBAL_PARAMS, override_params=override, context='Directions After')
                 ss.route_after["resp"] = resp_d2
                 ss.last_json["directions_after"] = resp_d2
 
@@ -1425,11 +1520,59 @@ with tabs[4]:
 # TAB 6: DEBUG
 # -----------------------------
 with tabs[5]:
-    st.subheader("Debug — Last API Call (exact request + exact response)")
-    if not ss.last_http:
+    st.subheader("Debug — API Calls (shareable)")
+    include_key = st.checkbox("Include API key in exported logs", value=False, help="Off by default. Turn on only when sharing with NextBillion support.", key="dbg_inc_key")
+
+    def _mask_key(obj: Any) -> Any:
+        if include_key:
+            return obj
+        try:
+            if isinstance(obj, dict):
+                out = {}
+                for k, v in obj.items():
+                    if k == "key" and isinstance(v, str) and v:
+                        out[k] = v[:4] + "..." + v[-4:]
+                    else:
+                        out[k] = _mask_key(v)
+                return out
+            if isinstance(obj, list):
+                return [_mask_key(x) for x in obj]
+            return obj
+        except Exception:
+            return obj
+
+    # Show last call
+    st.markdown("### Last API call (exact request + exact response)")
+    if not ss.get("last_http"):
         st.info("No API calls made yet in this session.")
     else:
-        st.json(ss.last_http)
+        st.json(_mask_key(ss.last_http))
+
+    # Show recent call history so fallback failures (403) are visible even if a retry succeeds
+    st.markdown("### Recent API calls (last 20)")
+    logs = ss.get("http_logs", [])[-20:]
+    if not logs:
+        st.info("No call history yet.")
+    else:
+        # compact selector
+        labels = [f"{i+1}. {l.get('context','') or ''} — {l.get('method','')} {l.get('status','')}" for i, l in enumerate(logs)]
+        sel = st.selectbox("Select a call to inspect", options=list(range(len(logs))), format_func=lambda i: labels[i], key="dbg_sel")
+        st.json(_mask_key(logs[sel]))
+
+        # downloads
+        st.download_button(
+            "Download recent API logs (JSON)",
+            data=json.dumps(_mask_key(logs), indent=2).encode("utf-8"),
+            file_name="nb_recent_api_logs.json",
+            mime="application/json",
+        )
 
     st.markdown("### Saved JSON bundles")
-    st.json(ss.last_json)
+    st.json(_mask_key(ss.last_json))
+
+    st.download_button(
+        "Download saved JSON bundles",
+        data=json.dumps(_mask_key(ss.last_json), indent=2).encode("utf-8"),
+        file_name="nb_saved_json_bundles.json",
+        mime="application/json",
+    )
