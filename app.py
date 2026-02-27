@@ -842,7 +842,7 @@ with st.sidebar:
 
     st.caption("Tip: Geocode once → reuse across all tabs (saves API calls).")
 
-aaatabs = st.tabs(["Geocode & Map", "Places (Search + Generate Stops)", "Route + Optimize (Before vs After)", "Distance Matrix (NxN)", "Snap-to-Road + Isochrone", "Debug (Last API Call)"])
+tabs = st.tabs(["Geocode & Map", "Places (Search + Generate Stops)", "Route + Optimize (Before vs After)", "Distance Matrix (NxN)", "Snap-to-Road + Isochrone", "Debug (Last API Call)"])
 
 # -----------------------------
 # TAB 1: GEOCODE & MAP
@@ -956,45 +956,36 @@ with tabs[1]:
             pts.append((center_lat + dlat, center_lng + dlng))
         return pts
 
-    if st.button("🎲 Generate random stops around center", key="pl_gen_random", width="stretch"):
+    gen_clicked = st.button("🎲 Generate random stops around center", key="pl_gen_random", width="stretch")
+    if gen_clicked:
         pts = gen_random_points(float(ss.center["lat"]), float(ss.center["lng"]), int(n_rand), int(radius_m), int(seed))
         rows = [{"label": f"Rand {i}", "address": "", "lat": la, "lng": ln} for i, (la, ln) in enumerate(pts, start=1)]
         add_stops(rows, "Random around center")
+        ss.mapsig["places"] += 1
 
-        # Resolve addresses (reverse geocode) — FIXED indentation + dtype safety
-                if resolve_addr == "Yes":
-            df = ss.stops_df.copy()
-            if "address" not in df.columns:
-                df["address"] = ""
-            df["address"] = df["address"].astype("string")
-
-            # Resolve addresses for ALL stops that have valid lat/lng
-            ref = (float(ss.center["lat"]), float(ss.center["lng"]))
-            for ridx, row in df.iterrows():
-                lat_c, lng_c, _sw = choose_latlng(row.get("lat"), row.get("lng"), ref=ref)
-                if lat_c is None or lng_c is None:
-                    continue
-
-                # Only overwrite if empty / missing
-                addr = str(row.get("address") or "").strip()
-                if addr != "" and addr.lower() != "nan":
-                    continue
-
-                try:
-                    status, rresp = geocode_reverse(float(lat_c), float(lng_c), language=language)
-                    cand = extract_geocode_candidates(rresp)
-                    if cand:
-                        df.loc[ridx, "lat"] = lat_c
-                        df.loc[ridx, "lng"] = lng_c
-                        df.loc[ridx, "address"] = str(cand[0]["name"])
-                        df.loc[ridx, "source"] = f"Reverse-geocode ({status})"
-                except Exception:
-                    continue
-
-            replace_stops(df)
-
-ss.mapsig["places"] += 1
-
+    # Resolve addresses (reverse geocode) for ALL stops missing address (not just random)
+    # Runs only when you generated stops in this click and "Resolve to Address" is Yes.
+    if gen_clicked and resolve_addr == "Yes":
+        df = ss.stops_df.copy()
+        if "address" not in df.columns:
+            df["address"] = ""
+        df["address"] = df["address"].astype("string")
+        # resolve only rows with valid lat/lng and empty address
+        mask = df["lat"].notna() & df["lng"].notna() & (df["address"].fillna("").astype(str).str.strip() == "")
+        for ridx, row in df[mask].iterrows():
+            try:
+                status, rresp = geocode_reverse(float(row["lat"]), float(row["lng"]), language=language)
+                cand = extract_geocode_candidates(rresp)
+                if cand:
+                    df.loc[ridx, "address"] = str(cand[0].get("name") or "")
+                    # Keep original source but annotate it
+                    if "source" in df.columns:
+                        source_old = str(row.get("source", "") or "").strip()
+                        df.loc[ridx, "source"] = (source_old + " | " if source_old else "") + f"Reverse-geocode ({status})"
+            except Exception:
+                continue
+        replace_stops(df)
+        ss.mapsig["places"] += 1
     st.markdown("### Stops table")
     st.dataframe(ss.stops_df, width="stretch", height=260)
 
