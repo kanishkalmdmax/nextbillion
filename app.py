@@ -327,6 +327,28 @@ def show_api_error(context: str, status: int, resp: Any) -> None:
         msg = str(msg) if msg else "Request failed"
         st.error(f"{context} failed (HTTP {status}): {msg}")
 
+
+def note_mode_fallback(context: str, requested_mode: str | None, used_mode: str | None, status: int, resp: Any) -> None:
+    """Persist and display when routing falls back (e.g., truck -> car) due to entitlement/region."""
+    try:
+        ss = st.session_state
+        if "last_json" not in ss:
+            ss.last_json = {}
+        ss.last_json[f"{context}_requested_mode"] = requested_mode
+        ss.last_json[f"{context}_used_mode"] = used_mode
+    except Exception:
+        pass
+
+    if requested_mode and used_mode and str(requested_mode) != str(used_mode):
+        # show the original failure prominently
+        msg = None
+        if isinstance(resp, dict):
+            msg = resp.get("msg") or resp.get("message") or resp.get("error")
+        msg = str(msg) if msg else "Request failed"
+        st.warning(
+            f"{context}: '{requested_mode}' failed (HTTP {status}: {msg}). Falling back to '{used_mode}'."
+        )
+
 # -----------------------------
 # PARSERS
 # -----------------------------
@@ -378,54 +400,59 @@ def extract_geocode_candidates(resp: Any) -> List[Dict[str, Any]]:
     return out
 
 def decode_polyline(polyline_str: str, precision: int = 5) -> List[Tuple[float, float]]:
+    """Decode an encoded polyline string into (lat, lng) points.
+
+    NextBillion Directions returns an encoded polyline in routes[0].geometry.
+    This implements the standard Google/OSRM polyline decoding algorithm.
+    """
     if not isinstance(polyline_str, str):
         return []
-    polyline_str = polyline_str.strip()
-    if not polyline_str:
+    s = polyline_str.strip()
+    if not s:
         return []
 
-    coordinates: List[Tuple[float, float]] = []
+    coords: List[Tuple[float, float]] = []
     index = 0
     lat = 0
     lng = 0
-    factor = 10 ** precision
-    length = len(polyline_str)
+    factor = 10 ** int(precision)
+    length = len(s)
 
-    try:
-        while index < length:
-            result = 1
-            shift = 0
-            while True:
-                if index >= length:
-                    return coordinates
-                b = ord(polyline_str[index]) - 63
-                index += 1
-                result += b << shift
-                shift += 5
-                if b < 0x1F:
-                    break
-            delta_lat = ~(result >> 1) if (result & 1) else (result >> 1)
-            lat += delta_lat
+    while index < length:
+        # latitude
+        result = 0
+        shift = 0
+        while True:
+            if index >= length:
+                return coords
+            b = ord(s[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+        lat += dlat
 
-            result = 1
-            shift = 0
-            while True:
-                if index >= length:
-                    return coordinates
-                b = ord(polyline_str[index]) - 63
-                index += 1
-                result += b << shift
-                shift += 5
-                if b < 0x1F:
-                    break
-            delta_lng = ~(result >> 1) if (result & 1) else (result >> 1)
-            lng += delta_lng
+        # longitude
+        result = 0
+        shift = 0
+        while True:
+            if index >= length:
+                return coords
+            b = ord(s[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlng = ~(result >> 1) if (result & 1) else (result >> 1)
+        lng += dlng
 
-            coordinates.append((lat / factor, lng / factor))
-    except Exception:
-        return coordinates
+        coords.append((lat / factor, lng / factor))
 
-    return coordinates
+    return coords
+
 
 def extract_route_geometry(resp: Any) -> List[Tuple[float, float]]:
     if not isinstance(resp, dict):
@@ -628,34 +655,51 @@ def geocode_reverse(lat: float, lng: float, language: str) -> Tuple[int, Any]:
 
 
 def distance_matrix(origins: List[str], destinations: List[str], params_extra: Dict[str, Any]) -> Tuple[int, Any]:
-    """Distance Matrix wrapper with safe fallback.
+    """Distance Matrix wrapper with fallback for entitlement/region issues.
+
     If the account/region isn't enabled for the selected mode (commonly 'truck'),
-    retry once with mode='car' so the UI can still render results.
+    retry once with mode='car' so the UI can still render results, and record it.
     """
     params = dict(params_extra)
     params["origins"] = "|".join(origins)
     params["destinations"] = "|".join(destinations)
 
+    requested_mode = params.get("mode")
+    used_mode = requested_mode
+
     stt, data = nb_get("/distancematrix/json", params=params)
     if stt == 404:
-        stt, data = nb_get("/distancematrix/v2", params=params)
+        stt, data = nb_get("/distancematrix", params=params)
 
-    # Region/mode entitlement fallback (common 403: 'Service not enabled for the requested region')
     if stt == 403 and isinstance(data, dict):
         msg = str(data.get("msg") or "")
-        if "Service not enabled" in msg and params.get("mode") and str(params.get("mode")) != "car":
+        if "Service not enabled" in msg and requested_mode and str(requested_mode) != "car":
+            # note original failure + fallback
+            note_mode_fallback("Distance Matrix", str(requested_mode), "car", stt, data)
             params2 = dict(params)
             params2["mode"] = "car"
+            used_mode = "car"
             stt, data = nb_get("/distancematrix/json", params=params2)
             if stt == 404:
-                stt, data = nb_get("/distancematrix/v2", params=params2)
-            if isinstance(ss.get("last_json"), dict):
-                ss.last_json["matrix_fallback_mode"] = "car"
+                stt, data = nb_get("/distancematrix", params=params2)
+
+    # persist requested/used (even if no fallback)
+    try:
+        ss = st.session_state
+        if "last_json" not in ss:
+            ss.last_json = {}
+        ss.last_json["matrix_requested_mode"] = requested_mode
+        ss.last_json["matrix_used_mode"] = used_mode
+    except Exception:
+        pass
+
     return stt, data
+
 def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any], override_params: Dict[str, Any] | None = None) -> Tuple[int, Any]:
-    """Directions wrapper (multi-stop) with safe fallback.
-    Some accounts aren't enabled for certain modes (commonly 'truck') in some regions.
-    If we get the entitlement 403, retry once with mode='car'.
+    """Directions wrapper (multi-stop) with fallback for entitlement/region issues.
+
+    If we get 403 'Service not enabled...' for a requested mode (commonly 'truck'),
+    retry once with mode='car' and record/display the fallback.
     """
     if len(order_latlng) < 2:
         return 0, {"error": "Need at least 2 points"}
@@ -673,21 +717,35 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any],
     if override_params:
         params = deep_merge(params, override_params)
 
+    requested_mode = params.get("mode")
+    used_mode = requested_mode
+
     stt, data = nb_get("/directions/json", params=params)
     if stt == 404:
         stt, data = nb_get("/directions", params=params)
 
     if stt == 403 and isinstance(data, dict):
         msg = str(data.get("msg") or "")
-        if "Service not enabled" in msg and params.get("mode") and str(params.get("mode")) != "car":
+        if "Service not enabled" in msg and requested_mode and str(requested_mode) != "car":
+            note_mode_fallback("Directions", str(requested_mode), "car", stt, data)
             params2 = dict(params)
             params2["mode"] = "car"
+            used_mode = "car"
             stt, data = nb_get("/directions/json", params=params2)
             if stt == 404:
                 stt, data = nb_get("/directions", params=params2)
-            if isinstance(ss.get("last_json"), dict):
-                ss.last_json["directions_fallback_mode"] = "car"
+
+    try:
+        ss = st.session_state
+        if "last_json" not in ss:
+            ss.last_json = {}
+        ss.last_json["directions_requested_mode"] = requested_mode
+        ss.last_json["directions_used_mode"] = used_mode
+    except Exception:
+        pass
+
     return stt, data
+
 def build_vrp_payload_v2(stops: pd.DataFrame, objective: str, routing_mode: str, traffic_ts: int) -> Dict[str, Any]:
     loc_list: List[str] = []
     for r in stops.reset_index(drop=True).itertuples():
