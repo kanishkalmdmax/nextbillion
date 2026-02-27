@@ -39,6 +39,12 @@ NB_BASE = "https://api.nextbillion.io"
 st.set_page_config(page_title="NextBillion.ai — Visual API Tester", layout="wide")
 YESNO = ["No", "Yes"]
 
+# Allow changing API key from UI
+if "api_key" not in st.session_state:
+    st.session_state.api_key = NB_API_KEY
+st.sidebar.text_input("NextBillion API Key", key="api_key")
+NB_API_KEY = st.session_state.api_key.strip() or NB_API_KEY
+
 # -----------------------------
 # HELPERS
 # -----------------------------
@@ -311,6 +317,16 @@ def nb_post(path: str, params: Dict[str, Any], body: Dict[str, Any], *, nocache:
     stt, parsed, _ = _http("POST", path, params=params, body=body, nocache=nocache)
     return stt, parsed
 
+
+def show_api_error(context: str, status: int, resp: Any) -> None:
+    """Display API error (status>=400) in the UI with a clear message."""
+    if status and status >= 400:
+        msg = None
+        if isinstance(resp, dict):
+            msg = resp.get("msg") or resp.get("message") or resp.get("error")
+        msg = str(msg) if msg else "Request failed"
+        st.error(f"{context} failed (HTTP {status}): {msg}")
+
 # -----------------------------
 # PARSERS
 # -----------------------------
@@ -553,9 +569,18 @@ def make_map(
                 pass
 
         try:
-            lats = [p[0] for p in route_pts]
-            lngs = [p[1] for p in route_pts]
-            m.fit_bounds([[min(lats), min(lngs)], [max(lats), max(lngs)]])
+            # Fit bounds using BOTH route points and stop pins so pins never "disappear"
+            pts = []
+            if route_pts:
+                pts.extend(route_pts)
+            for _, r in stops.iterrows():
+                lat_f, lng_f, _ = choose_latlng(r.get("lat"), r.get("lng"), ref=None)
+                if lat_f is not None:
+                    pts.append((lat_f, lng_f))
+            if pts:
+                lats = [p[0] for p in pts]
+                lngs = [p[1] for p in pts]
+                m.fit_bounds([[min(lats), min(lngs)], [max(lats), max(lngs)]])
         except Exception:
             pass
 
@@ -603,6 +628,10 @@ def geocode_reverse(lat: float, lng: float, language: str) -> Tuple[int, Any]:
 
 
 def distance_matrix(origins: List[str], destinations: List[str], params_extra: Dict[str, Any]) -> Tuple[int, Any]:
+    """Distance Matrix wrapper with safe fallback.
+    If the account/region isn't enabled for the selected mode (commonly 'truck'),
+    retry once with mode='car' so the UI can still render results.
+    """
     params = dict(params_extra)
     params["origins"] = "|".join(origins)
     params["destinations"] = "|".join(destinations)
@@ -610,9 +639,24 @@ def distance_matrix(origins: List[str], destinations: List[str], params_extra: D
     stt, data = nb_get("/distancematrix/json", params=params)
     if stt == 404:
         stt, data = nb_get("/distancematrix/v2", params=params)
-    return stt, data
 
+    # Region/mode entitlement fallback (common 403: 'Service not enabled for the requested region')
+    if stt == 403 and isinstance(data, dict):
+        msg = str(data.get("msg") or "")
+        if "Service not enabled" in msg and params.get("mode") and str(params.get("mode")) != "car":
+            params2 = dict(params)
+            params2["mode"] = "car"
+            stt, data = nb_get("/distancematrix/json", params=params2)
+            if stt == 404:
+                stt, data = nb_get("/distancematrix/v2", params=params2)
+            if isinstance(ss.get("last_json"), dict):
+                ss.last_json["matrix_fallback_mode"] = "car"
+    return stt, data
 def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any], override_params: Dict[str, Any] | None = None) -> Tuple[int, Any]:
+    """Directions wrapper (multi-stop) with safe fallback.
+    Some accounts aren't enabled for certain modes (commonly 'truck') in some regions.
+    If we get the entitlement 403, retry once with mode='car'.
+    """
     if len(order_latlng) < 2:
         return 0, {"error": "Need at least 2 points"}
 
@@ -631,14 +675,19 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any],
 
     stt, data = nb_get("/directions/json", params=params)
     if stt == 404:
-        stt, data = nb_get("/directions/v2", params=params)
-    if stt == 404:
-        stt, data = nb_get("/navigation/v2", params=params)
-    return stt, data
+        stt, data = nb_get("/directions", params=params)
 
-# -----------------------------
-# VRP v2 (payload shape correct)
-# -----------------------------
+    if stt == 403 and isinstance(data, dict):
+        msg = str(data.get("msg") or "")
+        if "Service not enabled" in msg and params.get("mode") and str(params.get("mode")) != "car":
+            params2 = dict(params)
+            params2["mode"] = "car"
+            stt, data = nb_get("/directions/json", params=params2)
+            if stt == 404:
+                stt, data = nb_get("/directions", params=params2)
+            if isinstance(ss.get("last_json"), dict):
+                ss.last_json["directions_fallback_mode"] = "car"
+    return stt, data
 def build_vrp_payload_v2(stops: pd.DataFrame, objective: str, routing_mode: str, traffic_ts: int) -> Dict[str, Any]:
     loc_list: List[str] = []
     for r in stops.reset_index(drop=True).itertuples():
@@ -770,6 +819,7 @@ with st.expander("Global route options (Directions / Matrix / Optimize)", expand
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
     with c1:
         mode = st.selectbox("Mode", ["car", "truck", "bike", "walk"], index=0, key="g_mode")
+        st.caption("Note: some accounts are not enabled for truck routing in certain regions. If you see a 403, the app will retry with car mode for display.")
     with c2:
         language = st.text_input("Language", value="en-US", key="g_lang")
     with c3:
@@ -1016,6 +1066,8 @@ with tabs[2]:
                 stt_d, resp_d = directions_multi_stop(stops_ll, params_extra=GLOBAL_PARAMS, override_params=override)
                 ss.route_before["resp"] = resp_d
                 ss.last_json["directions_before"] = resp_d
+                ss.last_json["directions_before_status"] = stt_d
+                show_api_error("Directions (Before)", stt_d, resp_d)
 
                 dist_m, dur_s = parse_distance_duration_from_directions(resp_d)
                 ss.route_before["distance_m"] = dist_m
@@ -1223,9 +1275,10 @@ with tabs[3]:
         if st.button("📐 Compute Distance Matrix (NxN)", key="mx_btn", width="stretch"):
             stt, data = distance_matrix(ll, ll, params_extra=GLOBAL_PARAMS)
             ss.last_json["matrix_nxn"] = data
+            ss.last_json["matrix_nxn_status"] = stt
             ss.mapsig["matrix"] += 1
+            show_api_error("Distance Matrix (NxN)", stt, data)
             if stt != 200:
-                st.error(f"Matrix failed: HTTP {stt}")
                 st.json(data)
             else:
                 st.success("Matrix computed.")
@@ -1275,9 +1328,9 @@ with tabs[4]:
                 st.warning("Need route geometry (2+ points). Compute directions first.")
             else:
                 stt, data = snap_to_road(pts)
+                ss.last_json["snap_status"] = stt
                 ss.mapsig["snap"] += 1
-                if stt != 200:
-                    st.error(f"Snap-to-road failed: HTTP {stt}")
+                show_api_error("Snap-to-Road", stt, data)
                 st.json(data)
 
         m5 = make_map(center=(float(ss.center["lat"]), float(ss.center["lng"])), stops=ss.stops_df, route_pts=coords[: int(n_path)] if coords else None, clicked=ss.clicked_pin, zoom=12)
@@ -1291,9 +1344,10 @@ with tabs[4]:
 
         if st.button("🟦 Compute Isochrone", key="iso_btn", width="stretch"):
             stt, data = isochrone(float(ss.center["lat"]), float(ss.center["lng"]), iso_type, int(iso_val), iso_mode)
+            ss.last_json["isochrone_status"] = stt
             ss.mapsig["iso"] += 1
+            show_api_error("Isochrone", stt, data)
             if stt != 200:
-                st.error(f"Isochrone failed: HTTP {stt}")
                 ss.iso_geojson = None
             else:
                 ss.iso_geojson = data if isinstance(data, dict) and data.get("type") == "FeatureCollection" else None
