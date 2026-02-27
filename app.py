@@ -33,7 +33,7 @@ except Exception:
 # -----------------------------
 # CONFIG
 # -----------------------------
-NB_API_KEY = "a08a2b15af0f432c8e438403bc2b00e3"
+NB_API_KEY = "c38ca23ad1eb4acbbb11c4b663f135c8"
 NB_BASE = "https://api.nextbillion.io"
 
 st.set_page_config(page_title="NextBillion.ai — Visual API Tester", layout="wide")
