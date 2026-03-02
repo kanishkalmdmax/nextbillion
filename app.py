@@ -1196,55 +1196,12 @@ tabs = st.tabs(["Geocode & Map", "Places (Search + Generate Stops)", "Route + Op
 # TAB 1: GEOCODE & MAP
 # -----------------------------
 with tabs[0]:
-    st.subheader("Geocode your stops and show them on the map")
-    maybe_fix_session_stops(ref=(float(ss.center["lat"]), float(ss.center["lng"])))
-    gcol1, gcol2 = st.columns([1, 1])
-    with gcol1:
-        country = st.text_input("Country filter (3-letter)", value=ss.center["country"], key="geo_country")
-    with gcol2:
-        if st.button("🌍 Set country filter", key="geo_set_country"):
-            ss.center["country"] = country.strip().upper()[:3] or ss.center["country"]
+    st.subheader("Geocode & Map (Deprecated)")
+    st.info(
+        "This tab is deprecated to keep the app fast and focused. Use **Places (Search + Generate Stops)** to create/edit stops and "
+        "**Route + Optimize** / **Distance Matrix** / **Snap-to-Road + Isochrone** to run API tests."
+    )
 
-    df = ss.stops_df.copy()
-
-    if st.button("🧭 Geocode all missing coordinates", key="geo_geocode_btn", width="stretch"):
-        missing = df[df["lat"].isna() | df["lng"].isna()].copy()
-        last_resp = None
-        for idx, row in missing.iterrows():
-            addr = str(row.get("address") or "").strip()
-            if not addr:
-                continue
-            status, resp = geocode_forward(addr, country=ss.center["country"], language=language)
-            last_resp = resp
-            candidates = extract_geocode_candidates(resp)
-            if candidates:
-                top = candidates[0]
-                df.loc[idx, "lat"] = top["lat"]
-                df.loc[idx, "lng"] = top["lng"]
-                df.loc[idx, "source"] = f"Geocoded ({status})"
-            else:
-                df.loc[idx, "source"] = f"Geocode failed ({status})"
-
-        replace_stops(df)
-        ss.last_json["geocode_response_sample"] = last_resp
-        ss.mapsig["geocode"] += 1
-
-    st.dataframe(ss.stops_df, width="stretch", height=220)
-
-    m = make_map(center=(float(ss.center["lat"]), float(ss.center["lng"])), stops=ss.stops_df, clicked=ss.clicked_pin)
-    map_ret = render_map(m, key=f"map_geocode_{ss.mapsig['geocode']}")
-
-    if map_ret and map_ret.get("last_clicked"):
-        lc = map_ret["last_clicked"]
-        lat_f, lng_f = normalize_latlng(lc.get("lat"), lc.get("lng"))
-        if lat_f is not None:
-            ss.clicked_pin = (lat_f, lng_f)
-            set_center(lat_f, lng_f)
-            ss.mapsig["geocode"] += 1
-
-# -----------------------------
-# TAB 2: PLACES + GENERATE STOPS
-# -----------------------------
 with tabs[1]:
     st.subheader("Search region/city → set center → generate 20+ random stops OR add POIs as stops")
     maybe_fix_session_stops(ref=(float(ss.center["lat"]), float(ss.center["lng"])))
@@ -1395,6 +1352,7 @@ with tabs[2]:
                     ss.route_before["geometry"] = []
 
                 ss.mapsig["route_before"] += 1
+                st.rerun()
 
             before_geom = ss.route_before.get("geometry") or []
             m_before = make_map(
@@ -1455,29 +1413,46 @@ with tabs[2]:
 
                 # Auto-poll result (quick) so Step 3 has a REAL optimized order.
                 # If user doesn't have permissions for routing mode/region, result can still exist but Directions might 403 later.
+
+                # Auto-poll result (quick) so Step 3 has a REAL optimized order.
+                # We try a few times because VRP is async and often isn't ready on the first hit.
+                def _apply_vrp_result(data_r: Any) -> bool:
+                    try:
+                        ss.vrp["result"] = data_r
+                        order = parse_vrp_order(data_r)
+                        ss.vrp["order"] = order
+
+                        df_after_local = None
+                        if order and isinstance(order, list):
+                            df2 = ss.stops_df.reset_index(drop=True).copy()
+                            valid = [i for i in order if isinstance(i, int) and 0 <= i < len(df2)]
+                            missing = [i for i in range(len(df2)) if i not in valid]
+                            final_order = valid + missing
+                            df_after_local = df2.iloc[final_order].reset_index(drop=True)
+
+                        if df_after_local is not None and not df_after_local.empty:
+                            ss._optimized_stops = df_after_local
+                            return True
+                    except Exception:
+                        pass
+                    return False
+
+                got_result = False
+                last_status = None
                 with st.spinner("Fetching optimization result..."):
-                    stt_r, data_r = vrp_result_v2(str(job_id))
-                if stt_r != 200:
-                    st.warning(f"VRP result not ready yet (HTTP {stt_r}). Use 'Fetch VRP result again' once it completes.")
+                    for _ in range(8):  # ~8 seconds total (1s each)
+                        stt_r, data_r = vrp_result_v2(str(job_id))
+                        last_status = stt_r
+                        if stt_r == 200 and _apply_vrp_result(data_r):
+                            got_result = True
+                            break
+                        time.sleep(1)
+
+                if got_result:
+                    st.info("Optimized order applied. Step 3 will recompute directions using the optimized stop order.")
+                    st.rerun()
                 else:
-                    ss.vrp["result"] = data_r
-                    order = parse_vrp_order(data_r)
-                    ss.vrp["order"] = order
-
-                    # Build reordered stops table (preserve labels + addresses).
-                    df_after = None
-                    if order and isinstance(order, list):
-                        df2 = ss.stops_df.reset_index(drop=True).copy()
-                        valid = [i for i in order if isinstance(i, int) and 0 <= i < len(df2)]
-                        missing = [i for i in range(len(df2)) if i not in valid]
-                        final_order = valid + missing
-                        df_after = df2.iloc[final_order].reset_index(drop=True)
-
-                    if df_after is not None and not df_after.empty:
-                        ss._optimized_stops = df_after
-                        st.info("Optimized order applied. Step 3 will recompute directions using the optimized stop order.")
-                    else:
-                        st.warning("Optimization succeeded, but no stop order was found in the VRP result. Step 3 will fall back to the current stop order.")
+                    st.warning(f"VRP result not ready yet (HTTP {last_status}). You can still click 'Fetch VRP result again' once it completes.")
             if st.button("🔄 Fetch VRP result again", key="vrp_fetch_btn", width="stretch"):
                 job_id = ss.vrp.get("job_id")
                 if not job_id:
@@ -1518,11 +1493,28 @@ with tabs[2]:
                 if override is None:
                     st.stop()
 
+
+                # Auto-fetch VRP result if needed (avoids requiring multiple clicks / manual fetch).
+                if ss.get("vrp", {}).get("job_id") and ss.get("_optimized_stops") is None:
+                    with st.spinner("Fetching optimization result..."):
+                        stt_r, data_r = vrp_result_v2(str(ss.vrp.get("job_id")))
+                    if stt_r == 200:
+                        ss.vrp["result"] = data_r
+                        order = parse_vrp_order(data_r)
+                        ss.vrp["order"] = order
+                        if order and isinstance(order, list):
+                            df2 = ss.stops_df.reset_index(drop=True).copy()
+                            valid = [i for i in order if isinstance(i, int) and 0 <= i < len(df2)]
+                            missing = [i for i in range(len(df2)) if i not in valid]
+                            final_order = valid + missing
+                            ss._optimized_stops = df2.iloc[final_order].reset_index(drop=True)
+                    else:
+                        st.warning(f"Optimization exists but result not ready (HTTP {stt_r}). Try again in a few seconds.")
+                        st.stop()
+
+                df_after = ss.get("_optimized_stops") or ss.stops_df.copy()
                 
                 # If user ran VRP but hasn't fetched/applied the optimized order yet, do not pretend "after" is optimized.
-                if ss.get("vrp", {}).get("job_id") and ss.get("_optimized_stops") is None:
-                    st.warning("Optimization job exists but optimized stop order is not applied yet. Click 'Fetch VRP result again' (Step 2) and retry.")
-                    st.stop()
                 ll_after = [latlng_str(float(r.lat), float(r.lng)) for r in df_after.itertuples()]
                 stt_d2, resp_d2 = directions_multi_stop(ll_after, params_extra=GLOBAL_PARAMS, override_params=override, context='Directions After')
                 ss.route_after["resp"] = resp_d2
@@ -1559,6 +1551,7 @@ with tabs[2]:
                     ss.route_after["geometry"] = []
 
                 ss.mapsig["route_after"] += 1
+                st.rerun()
 
             after_geom = ss.route_after.get("geometry") or []
             m_after = make_map(
