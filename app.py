@@ -268,6 +268,32 @@ def clear_stops():
 # -----------------------------
 # HTTP (debuggable)
 # -----------------------------
+
+def _lighten_for_log(obj: Any, *, max_str: int = 800, max_list: int = 50) -> Any:
+    """
+    Reduce huge responses (especially polylines/geometry) before storing in session logs.
+    This keeps the app responsive while still preserving the *actual* response used by the app.
+    """
+    try:
+        if isinstance(obj, str):
+            return obj if len(obj) <= max_str else (obj[:max_str] + f"... <truncated {len(obj)-max_str} chars>")
+        if isinstance(obj, list):
+            if len(obj) > max_list:
+                return [_lighten_for_log(x, max_str=max_str, max_list=max_list) for x in obj[:max_list]] + [f"... <truncated {len(obj)-max_list} items>"]
+            return [_lighten_for_log(x, max_str=max_str, max_list=max_list) for x in obj]
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                # geometry/polylines can be massive
+                if str(k).lower() in ("geometry", "polyline", "polylines"):
+                    out[k] = _lighten_for_log(v, max_str=max_str, max_list=max_list)
+                else:
+                    out[k] = _lighten_for_log(v, max_str=max_str, max_list=max_list)
+            return out
+        return obj
+    except Exception:
+        return obj
+
 def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None, timeout: int = 60, nocache: bool = False, context: str = "") -> Tuple[int, Any, str]:
     """
     Returns (status_code, parsed_json_or_text, raw_text).
@@ -337,7 +363,7 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
             "status": r.status_code,
             "response_headers": dict(r.headers),
             "raw_text": raw[:20000],
-            "parsed": parsed,
+            "parsed": _lighten_for_log(parsed),
         }
         ss.last_http = entry
 
@@ -385,6 +411,18 @@ def show_api_error(context: str, status: int, resp: Any) -> None:
             msg = resp.get("msg") or resp.get("message") or resp.get("error")
         msg = str(msg) if msg else "Request failed"
         st.error(f"{context} failed (HTTP {status}): {msg}")
+
+
+def api_success(status: int, resp: Any) -> bool:
+    """Best-effort check for NB API success."""
+    if status != 200:
+        return False
+    if isinstance(resp, dict):
+        stt = resp.get("status")
+        # Many NB APIs use {"status":"Ok"} on success
+        if stt is not None and str(stt).lower() not in ("ok", "success"):
+            return False
+    return True
 
 
 def note_mode_fallback(context: str, requested_mode: str | None, used_mode: str | None, status: int, resp: Any) -> None:
@@ -731,6 +769,48 @@ def sanitize_route_params(p: dict) -> tuple[dict, list[str]]:
 
     return out, warns
 
+
+def sanitize_dm_params(p: dict) -> tuple[dict, list[str]]:
+    """
+    Distance Matrix has a narrower set of supported avoid values compared to Directions.
+    Docs call out avoid/exclude preferences like tolls, highways, left/right turns, service roads. 
+    (If you pass other values, NB can respond with confusing messages like "unsupport avoid object".)
+    """
+    out = dict(p or {})
+    warns: list[str] = []
+
+    # reuse generic sanitizer first (types + delimiter normalization)
+    out, w2 = sanitize_route_params(out)
+    warns.extend(w2)
+
+    # allowlist based on Distance Matrix docs/features/examples
+    allowed = {
+        "toll", "tolls",
+        "highway", "highways",
+        "ferry",
+        "left_turn", "right_turn",
+        "service_road", "service_roads",
+        "none",
+    }
+
+    if "avoid" in out:
+        av = str(out.get("avoid") or "").strip()
+        parts = [a.strip() for a in av.replace(",", "|").replace(";", "|").split("|") if a.strip()]
+        bad = [a for a in parts if a not in allowed]
+        if bad:
+            warns.append(
+                "Distance Matrix: unsupported avoid values "
+                + ", ".join(bad)
+                + ". Supported (per docs): "
+                + ", ".join(sorted(allowed))
+                + ". Dropping avoid for this Distance Matrix call."
+            )
+            out.pop("avoid", None)
+        else:
+            out["avoid"] = "|".join(parts) if parts else out.pop("avoid", None)
+
+    return out, warns
+
 def geocode_forward(query: str, country: str, language: str) -> Tuple[int, Any]:
     params = {"key": NB_API_KEY, "q": query, "country": country, "language": language}
     stt, data = nb_get("/geocode", params=params)
@@ -755,6 +835,9 @@ def distance_matrix(origins: List[str], destinations: List[str], params_extra: D
       retry once with mode='car' so the UI can still render results, and record it.
     """
     params = dict(params_extra) if params_extra else {}
+    params, dm_warns = sanitize_dm_params(params)
+    for w in dm_warns:
+        st.warning(w)
     params["origins"] = "|".join(origins)
     params["destinations"] = "|".join(destinations)
 
@@ -1283,28 +1366,34 @@ with tabs[2]:
                 ss.last_json["directions_before"] = resp_d
                 ss.last_json["directions_before_status"] = stt_d
                 show_api_error("Directions (Before)", stt_d, resp_d)
+                if api_success(stt_d, resp_d):
+                    dist_m, dur_s = parse_distance_duration_from_directions(resp_d)
+                    ss.route_before["distance_m"] = dist_m
+                    ss.route_before["duration_s"] = dur_s
 
-                dist_m, dur_s = parse_distance_duration_from_directions(resp_d)
-                ss.route_before["distance_m"] = dist_m
-                ss.route_before["duration_s"] = dur_s
+                    if dist_m is None or dur_s is None:
+                        stt_m, data_m = distance_matrix(stops_ll[:-1], stops_ll[1:], params_extra=GLOBAL_PARAMS)
+                        ss.last_json["matrix_pairs_before"] = data_m
+                        dist_total = 0.0
+                        dur_total = 0.0
+                        if isinstance(data_m, dict):
+                            rows = data_m.get("rows") or []
+                            for row in rows:
+                                elems = (row or {}).get("elements") or []
+                                if elems:
+                                    e0 = elems[0]
+                                    dist_total += float((e0.get("distance") or {}).get("value") or 0)
+                                    dur_total += float((e0.get("duration") or {}).get("value") or 0)
+                        ss.route_before["distance_m"] = dist_total
+                        ss.route_before["duration_s"] = dur_total
 
-                if dist_m is None or dur_s is None:
-                    stt_m, data_m = distance_matrix(stops_ll[:-1], stops_ll[1:], params_extra=GLOBAL_PARAMS)
-                    ss.last_json["matrix_pairs_before"] = data_m
-                    dist_total = 0.0
-                    dur_total = 0.0
-                    if isinstance(data_m, dict):
-                        rows = data_m.get("rows") or []
-                        for row in rows:
-                            elems = (row or {}).get("elements") or []
-                            if elems:
-                                e0 = elems[0]
-                                dist_total += float((e0.get("distance") or {}).get("value") or 0)
-                                dur_total += float((e0.get("duration") or {}).get("value") or 0)
-                    ss.route_before["distance_m"] = dist_total
-                    ss.route_before["duration_s"] = dur_total
+                    ss.route_before["geometry"] = extract_route_geometry(resp_d)
+                else:
+                    # Clear stale geometry/metrics so the map doesn't keep showing an old successful route
+                    ss.route_before["distance_m"] = None
+                    ss.route_before["duration_s"] = None
+                    ss.route_before["geometry"] = []
 
-                ss.route_before["geometry"] = extract_route_geometry(resp_d)
                 ss.mapsig["route_before"] += 1
 
             before_geom = ss.route_before.get("geometry") or []
@@ -1408,27 +1497,36 @@ with tabs[2]:
                 ss.route_after["resp"] = resp_d2
                 ss.last_json["directions_after"] = resp_d2
 
-                dist_m2, dur_s2 = parse_distance_duration_from_directions(resp_d2)
-                ss.route_after["distance_m"] = dist_m2
-                ss.route_after["duration_s"] = dur_s2
+                ss.last_json["directions_after_status"] = stt_d2
+                show_api_error("Directions (After)", stt_d2, resp_d2)
 
-                if dist_m2 is None or dur_s2 is None:
-                    stt_m2, data_m2 = distance_matrix(ll_after[:-1], ll_after[1:], params_extra=GLOBAL_PARAMS)
-                    ss.last_json["matrix_pairs_after"] = data_m2
-                    dist_total2 = 0.0
-                    dur_total2 = 0.0
-                    if isinstance(data_m2, dict):
-                        rows = data_m2.get("rows") or []
-                        for row in rows:
-                            elems = (row or {}).get("elements") or []
-                            if elems:
-                                e0 = elems[0]
-                                dist_total2 += float((e0.get("distance") or {}).get("value") or 0)
-                                dur_total2 += float((e0.get("duration") or {}).get("value") or 0)
-                    ss.route_after["distance_m"] = dist_total2
-                    ss.route_after["duration_s"] = dur_total2
+                if api_success(stt_d2, resp_d2):
+                    dist_m2, dur_s2 = parse_distance_duration_from_directions(resp_d2)
+                    ss.route_after["distance_m"] = dist_m2
+                    ss.route_after["duration_s"] = dur_s2
 
-                ss.route_after["geometry"] = extract_route_geometry(resp_d2)
+                    if dist_m2 is None or dur_s2 is None:
+                        stt_m2, data_m2 = distance_matrix(ll_after[:-1], ll_after[1:], params_extra=GLOBAL_PARAMS)
+                        ss.last_json["matrix_pairs_after"] = data_m2
+                        dist_total2 = 0.0
+                        dur_total2 = 0.0
+                        if isinstance(data_m2, dict):
+                            rows = data_m2.get("rows") or []
+                            for row in rows:
+                                elems = (row or {}).get("elements") or []
+                                if elems:
+                                    e0 = elems[0]
+                                    dist_total2 += float((e0.get("distance") or {}).get("value") or 0)
+                                    dur_total2 += float((e0.get("duration") or {}).get("value") or 0)
+                        ss.route_after["distance_m"] = dist_total2
+                        ss.route_after["duration_s"] = dur_total2
+
+                    ss.route_after["geometry"] = extract_route_geometry(resp_d2)
+                else:
+                    ss.route_after["distance_m"] = None
+                    ss.route_after["duration_s"] = None
+                    ss.route_after["geometry"] = []
+
                 ss.mapsig["route_after"] += 1
 
             after_geom = ss.route_after.get("geometry") or []
