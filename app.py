@@ -967,7 +967,52 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any],
     ss.last_json[f"{context.lower().replace(' ','_')}_requested_mode"] = requested_mode
     ss.last_json[f"{context.lower().replace(' ','_')}_used_mode"] = requested_mode
 
-    # If 403 "service not enabled" or similar entitlement issue, fallback truck->car only (do not mask other errors)
+    
+
+    # If route couldn't be generated because at least one point can't be snapped,
+    # auto-run Snap-to-Road for the input points and retry once (helps restore polyline).
+    if stt in (400, 422) and isinstance(resp, dict):
+        emsg = (resp.get("errorMessage") or resp.get("msg") or "").lower()
+        status_txt = (resp.get("status") or "").lower()
+        if ("can not be snapped" in emsg) or ("cannot be snapped" in emsg) or ("nosegment" in status_txt):
+            ss.last_json[f"{context.lower().replace(' ','_')}_snap_retry_triggered"] = {"status": stt, "resp": resp}
+            try:
+                pts = []
+                for s in order_latlng:
+                    a,b = s.split(",")
+                    pts.append((float(a), float(b)))
+                stt_s, resp_s = snap_to_road(pts)
+                ss.last_json[f"{context.lower().replace(' ','_')}_snap_response"] = resp_s
+                if stt_s == 200 and isinstance(resp_s, dict) and resp_s.get("snappedPoints"):
+                    sp = resp_s.get("snappedPoints") or []
+                    snapped_ll = []
+                    for i, item in enumerate(sp):
+                        loc = item.get("location") or {}
+                        lat = loc.get("lat")
+                        lng = loc.get("lng")
+                        if lat is None or lng is None:
+                            continue
+                        snapped_ll.append(latlng_str(float(lat), float(lng)))
+                    # only retry if we preserved at least origin+dest
+                    if len(snapped_ll) >= 2:
+                        origin = snapped_ll[0]
+                        dest = snapped_ll[-1]
+                        waypoints = snapped_ll[1:-1]
+                        qparams2 = dict(qparams)
+                        qparams2["origin"] = origin
+                        qparams2["destination"] = dest
+                        if waypoints:
+                            qparams2["waypoints"] = "|".join(waypoints)
+                        else:
+                            qparams2.pop("waypoints", None)
+                        stt_r, resp_r = do_call(qparams2, body, f"{context} ({requested_mode}) [snap-retry]")
+                        ss.last_json[f"{context.lower().replace(' ','_')}_used_mode"] = requested_mode
+                        ss.last_json[f"{context.lower().replace(' ','_')}_snap_retry_request"] = {"method": method, "url": NB_BASE + "/directions/json", "params": qparams2, "body": body}
+                        if stt_r == 200 and isinstance(resp_r, dict) and (resp_r.get("routes") or []):
+                            return stt_r, resp_r
+            except Exception as _e:
+                ss.last_json[f"{context.lower().replace(' ','_')}_snap_retry_error"] = str(_e)
+# If 403 "service not enabled" or similar entitlement issue, fallback truck->car only (do not mask other errors)
     if stt == 403 and requested_mode == "truck":
         msg = resp.get("msg") if isinstance(resp, dict) else str(resp)
         st.warning(f"{context}: 'truck' failed (HTTP 403). Falling back to 'car'. Message: {msg}")
@@ -1512,7 +1557,8 @@ with tabs[2]:
                         st.warning(f"Optimization exists but result not ready (HTTP {stt_r}). Try again in a few seconds.")
                         st.stop()
 
-                df_after = ss.get("_optimized_stops") or ss.stops_df.copy()
+                df_opt = ss.get("_optimized_stops")
+            df_after = df_opt.copy() if isinstance(df_opt, pd.DataFrame) and not df_opt.empty else ss.stops_df.copy()
                 
                 # If user ran VRP but hasn't fetched/applied the optimized order yet, do not pretend "after" is optimized.
                 ll_after = [latlng_str(float(r.lat), float(r.lng)) for r in df_after.itertuples()]
