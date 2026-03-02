@@ -1558,8 +1558,8 @@ with tabs[2]:
                         st.stop()
 
                 df_opt = ss.get("_optimized_stops")
-            df_after = df_opt.copy() if isinstance(df_opt, pd.DataFrame) and not df_opt.empty else ss.stops_df.copy()
-                
+                df_after = df_opt.copy() if isinstance(df_opt, pd.DataFrame) and not df_opt.empty else ss.stops_df.copy()
+
                 # If user ran VRP but hasn't fetched/applied the optimized order yet, do not pretend "after" is optimized.
                 ll_after = [latlng_str(float(r.lat), float(r.lng)) for r in df_after.itertuples()]
                 stt_d2, resp_d2 = directions_multi_stop(ll_after, params_extra=GLOBAL_PARAMS, override_params=override, context='Directions After')
