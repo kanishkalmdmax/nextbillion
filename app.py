@@ -336,8 +336,8 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
                     if "http_logs" not in ss:
                         ss.http_logs = []
                     ss.http_logs.append(entry)
-                    if len(ss.http_logs) > 200:
-                        ss.http_logs = ss.http_logs[-200:]
+                    if len(ss.http_logs) > 80:
+                        ss.http_logs = ss.http_logs[-80:]
                     return status_c, parsed_c, raw_c or ""
         except Exception:
             pass
@@ -371,8 +371,8 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
             ss.http_logs = []
         ss.http_logs.append(entry)
         # keep last 200
-        if len(ss.http_logs) > 200:
-            ss.http_logs = ss.http_logs[-200:]
+        if len(ss.http_logs) > 80:
+            ss.http_logs = ss.http_logs[-80:]
 
 
         # store in cache (best-effort)
@@ -391,8 +391,8 @@ def _http(method: str, path: str, params: Dict[str, Any] | None = None, body: Di
         if "http_logs" not in ss:
             ss.http_logs = []
         ss.http_logs.append(entry)
-        if len(ss.http_logs) > 200:
-            ss.http_logs = ss.http_logs[-200:]
+        if len(ss.http_logs) > 80:
+            ss.http_logs = ss.http_logs[-80:]
         return 0, {"error": str(e)}, str(e)
 
 def nb_get(path: str, params: Dict[str, Any], *, nocache: bool = False, context: str = "") -> Tuple[int, Any]:
@@ -1363,7 +1363,7 @@ with tabs[2]:
 
                 stt_d, resp_d = directions_multi_stop(stops_ll, params_extra=GLOBAL_PARAMS, override_params=override, context='Directions Before')
                 ss.route_before["resp"] = resp_d
-                ss.last_json["directions_before"] = resp_d
+                ss.last_json["directions_before"] = _lighten_for_log(resp_d, max_str=1200, max_list=30)
                 ss.last_json["directions_before_status"] = stt_d
                 show_api_error("Directions (Before)", stt_d, resp_d)
                 if api_success(stt_d, resp_d):
@@ -1446,12 +1446,38 @@ with tabs[2]:
                 if stt_c != 200:
                     st.error(f"VRP create failed: HTTP {stt_c}")
                     st.json(data_c)
-                else:
-                    ss.vrp["create"] = data_c
-                    job_id = data_c.get("id") or data_c.get("job_id") or data_c.get("jobId")
-                    ss.vrp["job_id"] = job_id
-                    st.success(f"Optimization job created: {job_id}")
+                    st.stop()
 
+                ss.vrp["create"] = data_c
+                job_id = data_c.get("id") or data_c.get("job_id") or data_c.get("jobId")
+                ss.vrp["job_id"] = job_id
+                st.success(f"Optimization job created: {job_id}")
+
+                # Auto-poll result (quick) so Step 3 has a REAL optimized order.
+                # If user doesn't have permissions for routing mode/region, result can still exist but Directions might 403 later.
+                with st.spinner("Fetching optimization result..."):
+                    stt_r, data_r = vrp_result_v2(str(job_id))
+                if stt_r != 200:
+                    st.warning(f"VRP result not ready yet (HTTP {stt_r}). Use 'Fetch VRP result again' once it completes.")
+                else:
+                    ss.vrp["result"] = data_r
+                    order = parse_vrp_order(data_r)
+                    ss.vrp["order"] = order
+
+                    # Build reordered stops table (preserve labels + addresses).
+                    df_after = None
+                    if order and isinstance(order, list):
+                        df2 = ss.stops_df.reset_index(drop=True).copy()
+                        valid = [i for i in order if isinstance(i, int) and 0 <= i < len(df2)]
+                        missing = [i for i in range(len(df2)) if i not in valid]
+                        final_order = valid + missing
+                        df_after = df2.iloc[final_order].reset_index(drop=True)
+
+                    if df_after is not None and not df_after.empty:
+                        ss._optimized_stops = df_after
+                        st.info("Optimized order applied. Step 3 will recompute directions using the optimized stop order.")
+                    else:
+                        st.warning("Optimization succeeded, but no stop order was found in the VRP result. Step 3 will fall back to the current stop order.")
             if st.button("🔄 Fetch VRP result again", key="vrp_fetch_btn", width="stretch"):
                 job_id = ss.vrp.get("job_id")
                 if not job_id:
@@ -1492,10 +1518,15 @@ with tabs[2]:
                 if override is None:
                     st.stop()
 
+                
+                # If user ran VRP but hasn't fetched/applied the optimized order yet, do not pretend "after" is optimized.
+                if ss.get("vrp", {}).get("job_id") and ss.get("_optimized_stops") is None:
+                    st.warning("Optimization job exists but optimized stop order is not applied yet. Click 'Fetch VRP result again' (Step 2) and retry.")
+                    st.stop()
                 ll_after = [latlng_str(float(r.lat), float(r.lng)) for r in df_after.itertuples()]
                 stt_d2, resp_d2 = directions_multi_stop(ll_after, params_extra=GLOBAL_PARAMS, override_params=override, context='Directions After')
                 ss.route_after["resp"] = resp_d2
-                ss.last_json["directions_after"] = resp_d2
+                ss.last_json["directions_after"] = _lighten_for_log(resp_d2, max_str=1200, max_list=30)
 
                 ss.last_json["directions_after_status"] = stt_d2
                 show_api_error("Directions (After)", stt_d2, resp_d2)
