@@ -962,6 +962,23 @@ def directions_multi_stop(order_latlng: List[str], params_extra: Dict[str, Any],
     requested_mode = (params.get("mode") or "").strip() or "car"
     stt, resp = do_call(qparams, body, f"{context} ({requested_mode})")
 
+    # If avoid caused a 400/validation error (common: "unsupport avoid object"), retry once without avoid.
+    if stt == 400:
+        raw_msg = ""
+        if isinstance(resp, dict):
+            raw_msg = str(resp.get("msg") or resp.get("errorMessage") or resp.get("status") or "")
+        else:
+            raw_msg = str(resp or "")
+        if "avoid" in (body or qparams) and ("unsupport avoid" in raw_msg.lower() or "unsupported avoid" in raw_msg.lower() or "invalid avoid" in raw_msg.lower()):
+            st.warning(f"{context}: avoid values not supported for this endpoint/mode. Retrying without avoid.")
+            if method == "GET":
+                qparams = dict(qparams)
+                qparams.pop("avoid", None)
+            else:
+                body = dict(body or {})
+                body.pop("avoid", None)
+            stt, resp = do_call(qparams, body, f"{context} ({requested_mode}) - retry_no_avoid")
+
     # Store request params for sharing (include both query & body)
     ss.last_json[f"{context.lower().replace(' ','_')}_request"] = {"method": method, "url": NB_BASE + "/directions/json", "params": qparams, "body": body}
     ss.last_json[f"{context.lower().replace(' ','_')}_requested_mode"] = requested_mode
@@ -1119,17 +1136,24 @@ def parse_vrp_order(resp: Any) -> Optional[List[int]]:
 # -----------------------------
 # SNAP + ISO
 # -----------------------------
-def snap_to_road(points: List[Tuple[float, float]]) -> Tuple[int, Any]:
+def snap_to_road(points: List[Tuple[float, float]], mode: str = "car") -> Tuple[int, Any]:
+    """Snap points to roads using Snap To Roads API.
+
+    Docs: GET/POST https://api.nextbillion.io/snapToRoads/json?key=... with body containing 'path' (pipe-delimited lat,lng).
+    """
     params = {"key": NB_API_KEY}
-    body = {"points": [{"lat": p[0], "lng": p[1]} for p in points]}
-    ss.last_json["snap_payload"] = body
+    # API expects a single 'path' string: "lat,lng|lat,lng|..."
+    path_str = "|".join([f"{float(lat)},{float(lng)}" for lat, lng in points])
+    body: Dict[str, Any] = {"path": path_str, "mode": mode}
 
-    stt, data = nb_post("/snapToRoad/v2", params=params, body=body)
-    if stt == 404:
-        stt, data = nb_post("/snaptoroad/v2", params=params, body=body)
-    if stt == 404:
-        stt, data = nb_post("/snapToRoad", params=params, body=body)
+    ss.last_json["snap_request"] = {
+        "method": "POST",
+        "url": f"{NB_BASE_URL}/snapToRoads/json",
+        "params": params,
+        "body": body,
+    }
 
+    stt, data = nb_post("/snapToRoads/json", params=params, body=body)
     ss.last_json["snap_response"] = data
     return stt, data
 
@@ -1172,7 +1196,7 @@ with st.expander("Global route options (Directions / Matrix / Optimize)", expand
     with c4:
         alternatives = st.selectbox("Alternatives", YESNO, index=0, key="g_alts")
 
-    avoid_options = ["toll", "highway", "ferry", "indoor", "unpaved", "tunnel", "sharp_turn", "u_turn", "service_road"]
+    avoid_options = ["toll", "highway", "ferry", "left_turn", "right_turn", "service_road"]  # keep to values known to work across Directions/Matrix; extend later as needed
     avoid = st.multiselect("Avoid", avoid_options, default=[], key="g_avoid")
 
     dep_col1, dep_col2 = st.columns([1, 1])
